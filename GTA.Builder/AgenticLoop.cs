@@ -48,7 +48,7 @@ namespace GTA.Builder
                 ct.ThrowIfCancellationRequested();
 
                 if (injectionQueue != null)
-                    await WaitWhilePausedAsync(injectionQueue, logger, ct);
+                    await WaitWhilePausedAsync(logger, ct, injectionQueue);
 
                 if (injectionQueue != null)
                 {
@@ -152,18 +152,18 @@ namespace GTA.Builder
                             logger.BeginSubAgentDispatch(subTask, client.ModelName, renderer);
 
                         logger.LogInfo(
-                            "⏸ Paused — dispatched a Sub Agent to work on a task. Holding before the " +
-                            "next round starts (this round's own thinking/tool-calls already in flight " +
-                            "are unaffected) until it reports back.");
+                            "🤖 Dispatched a Sub Agent to work on a task. This chat waits for its report. " +
+                            "A pause (⏸ Pause or the 💉 Inject window's hold) is respected: the Sub Agent " +
+                            "holds before its next round, and this chat holds before ITS next round.");
 
                         (bool subSuccess, string subMessage) = await RunDispatchedSubAgentAsync(
                             messages, tools, subTask, client, settings, effectiveSystemPrompt,
-                            subLogger, subRenderer, allowUseShell, allowFileMutation, ct)
+                            subLogger, subRenderer, allowUseShell, allowFileMutation, ct, injectionQueue)
                             .ConfigureAwait(false);
 
                         logger.EndSubAgentDispatch(subSuccess, subMessage);
 
-                        logger.LogInfo("▶ Resumed — continuing to the next round.");
+                        logger.LogInfo("🤖 Sub Agent reported back.");
 
                         string reportPreview = $"[Sub Agent {(subSuccess ? "SUCCESS" : "FAILURE")}] {subMessage}";
                         logger.LogToolResult(id, reportPreview);
@@ -233,7 +233,8 @@ namespace GTA.Builder
             IStreamRenderer   subRenderer,
             bool              allowUseShell,
             bool              allowFileMutation,
-            CancellationToken ct)
+            CancellationToken ct,
+            IPromptInjectionQueue? parentGate = null)
         {
             var subMessages = new JsonArray();
             for (int i = 0; i < realMessages.Count - 1; i++)
@@ -279,6 +280,11 @@ namespace GTA.Builder
                 for (int round = 1; round <= AppConfig.MAX_AGENTIC_ROUNDS; round++)
                 {
                     ct.ThrowIfCancellationRequested();
+
+                    // BUG FIX: the sub agent never looked at any pause, so "Pause" did nothing while it ran.
+                    await WaitWhilePausedAsync(subLogger, ct, parentGate, subLogger.PauseGate)
+                        .ConfigureAwait(false);
+
                     subLogger.LogRound(round);
 
                     JsonObject? resp = await client.CallAsync(
@@ -492,30 +498,42 @@ namespace GTA.Builder
             return (true, finalText.Trim());
         }
 
-        private static async Task WaitWhilePausedAsync(
-            IPromptInjectionQueue injectionQueue,
-            IAgentLogger          logger,
-            CancellationToken     ct)
+        private static bool AnyPaused(IPromptInjectionQueue?[] gates)
         {
-            if (!injectionQueue.IsPaused) return;
+            foreach (IPromptInjectionQueue? g in gates)
+                if (g != null && g.IsPaused) return true;
+            return false;
+        }
 
-            injectionQueue.OnPauseWaitStart();
+        /// <summary>
+        /// Holds while ANY of the gates says "paused". The main loop passes its own session's gate.
+        /// A dispatched sub agent passes BOTH its parent's gate and its own session's gate, so pausing
+        /// either one really stops the sub agent before its next round.
+        /// </summary>
+        private static async Task WaitWhilePausedAsync(
+            IAgentLogger                 logger,
+            CancellationToken            ct,
+            params IPromptInjectionQueue?[] gates)
+        {
+            if (!AnyPaused(gates)) return;
+
+            foreach (IPromptInjectionQueue? g in gates) g?.OnPauseWaitStart();
             try
             {
                 logger.LogInfo(
                     "⏸ Paused — holding before the next round starts (thinking/tool execution " +
                     "already in flight is never affected) until resumed — either the host UI's own " +
-                    "explicit \"⏸ Pause\"/\"▶ Resume\" button, or by closing the 💉 Inject popup, " +
+                    "explicit \"⏸ Pause\"/\"▶ Resume\" button, or the hold of the 💉 Inject window, " +
                     "whichever is currently holding it.");
 
-                while (injectionQueue.IsPaused)
+                while (AnyPaused(gates))
                     await Task.Delay(200, ct).ConfigureAwait(false);
 
                 logger.LogInfo("▶ Resumed — continuing to the next round.");
             }
             finally
             {
-                injectionQueue.OnPauseWaitEnd();
+                foreach (IPromptInjectionQueue? g in gates) g?.OnPauseWaitEnd();
             }
         }
 

@@ -1,4 +1,4 @@
-namespace GTA.Core
+﻿namespace GTA.Core
 {
     /// <summary>Thin logging interface for the agentic loop and HTTP transport layer.</summary>
     public interface IAgentLogger
@@ -47,5 +47,12 @@ namespace GTA.Core
             string task, string modelName, IStreamRenderer mainRenderer) => (this, mainRenderer);
 
         void EndSubAgentDispatch(bool success, string message) { }
+
+        /// <summary>
+        /// The host's pause gate for the session this logger writes to (or null if the host has none).
+        /// A dispatched sub agent checks this gate before every round, so pausing the sub agent's own
+        /// session really holds it.
+        /// </summary>
+        IPromptInjectionQueue? PauseGate => null;
     }
 }

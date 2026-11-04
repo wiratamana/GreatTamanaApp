@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
@@ -94,13 +94,22 @@ public sealed class ChatSessionRuntime : IPromptInjectionQueue
 
     public HashSet<string> PreloadedToolNames { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+    // ── Injection queue ───────────────────────────────────────────────────
+    // A plain list (not a Queue) so the user can edit / remove one message while it waits.
+
     private readonly object _injectionLock = new();
-    private readonly Queue<PendingInjection> _pendingInjections = new();
+    private readonly List<PendingInjection> _pendingInjections = new();
+
+    /// <summary>Raised (on ANY thread) whenever the queue changes: add, edit, remove, clear, or drained by the agent.</summary>
+    public event Action? InjectionQueueChanged;
+
+    private void RaiseInjectionQueueChanged() => InjectionQueueChanged?.Invoke();
 
     public void EnqueueInjection(PendingInjection injection)
     {
         lock (_injectionLock)
-            _pendingInjections.Enqueue(injection);
+            _pendingInjections.Add(injection);
+        RaiseInjectionQueueChanged();
     }
 
     public int PendingInjectionCount
@@ -108,31 +117,138 @@ public sealed class ChatSessionRuntime : IPromptInjectionQueue
         get { lock (_injectionLock) return _pendingInjections.Count; }
     }
 
-    /// <summary>DrainPending — atomically removes and returns every injection queued so far (FIFO), or an empty list if none are pending.</summary>
-    public List<PendingInjection> DrainPending()
+    /// <summary>Copies of everything still waiting, in delivery order. Safe to show / edit in the UI.</summary>
+    public List<PendingInjection> SnapshotPending()
     {
         lock (_injectionLock)
         {
-            if (_pendingInjections.Count == 0) return new List<PendingInjection>();
-            var drained = new List<PendingInjection>(_pendingInjections);
-            _pendingInjections.Clear();
-            return drained;
+            var copy = new List<PendingInjection>(_pendingInjections.Count);
+            foreach (var p in _pendingInjections) copy.Add(p.Clone());
+            return copy;
         }
     }
 
-    private volatile bool _isPaused     = false;
+    /// <summary>
+    /// Replaces text / files / tools of one queued message. Keeps its place in the queue.
+    /// Returns false if it is not queued any more (the agent already took it).
+    /// </summary>
+    public bool UpdateInjection(string id, string text, IEnumerable<string> files, IEnumerable<string> toolNames)
+    {
+        lock (_injectionLock)
+        {
+            var item = _pendingInjections.Find(p => p.Id == id);
+            if (item == null) return false;
+            item.Text            = text;
+            item.Files           = new List<string>(files);
+            item.ToolNamesToLoad = new List<string>(toolNames);
+        }
+        RaiseInjectionQueueChanged();
+        return true;
+    }
+
+    /// <summary>Removes one queued message. Returns false if it is not queued any more.</summary>
+    public bool RemoveInjection(string id)
+    {
+        bool removed;
+        lock (_injectionLock)
+            removed = _pendingInjections.RemoveAll(p => p.Id == id) > 0;
+        if (removed) RaiseInjectionQueueChanged();
+        return removed;
+    }
+
+    /// <summary>Moves one queued message up (-1) or down (+1). Returns false if it can not move.</summary>
+    public bool MoveInjection(string id, int delta)
+    {
+        lock (_injectionLock)
+        {
+            int idx = _pendingInjections.FindIndex(p => p.Id == id);
+            int to  = idx + delta;
+            if (idx < 0 || to < 0 || to >= _pendingInjections.Count) return false;
+            (_pendingInjections[idx], _pendingInjections[to]) = (_pendingInjections[to], _pendingInjections[idx]);
+        }
+        RaiseInjectionQueueChanged();
+        return true;
+    }
+
+    /// <summary>Removes every queued message. Returns how many were removed.</summary>
+    public int ClearInjections()
+    {
+        int n;
+        lock (_injectionLock)
+        {
+            n = _pendingInjections.Count;
+            _pendingInjections.Clear();
+        }
+        if (n > 0) RaiseInjectionQueueChanged();
+        return n;
+    }
+
+    /// <summary>DrainPending — atomically removes and returns every injection queued so far (FIFO), or an empty list if none are pending.</summary>
+    public List<PendingInjection> DrainPending()
+    {
+        List<PendingInjection> drained;
+        lock (_injectionLock)
+        {
+            if (_pendingInjections.Count == 0) return new List<PendingInjection>();
+            drained = new List<PendingInjection>(_pendingInjections);
+            _pendingInjections.Clear();
+        }
+        RaiseInjectionQueueChanged();
+        return drained;
+    }
+
+    // ── Pause ─────────────────────────────────────────────────────────────
+    // BUG FIX: there used to be ONE shared "_isPaused" bool, set by the inject popup AND by the
+    // sub-agent dispatch. When the sub agent finished it called Resume() and wiped the inject
+    // popup's pause, so the agent "whooshed" into the next round. Now every owner has its own
+    // hold. Releasing one never releases another.
+
+    private readonly object _holdLock = new();
+    private readonly HashSet<object> _holds = new();
+
     private volatile bool _isUserPaused = false;
 
-    /// <summary>IsPaused.</summary>
-    public bool IsPaused => _isPaused || _isUserPaused;
+    /// <summary>True when ANY owner (inject window, ...) or the user's own Pause holds this session.</summary>
+    public bool IsPaused
+    {
+        get
+        {
+            if (_isUserPaused) return true;
+            lock (_holdLock) return _holds.Count > 0;
+        }
+    }
 
-    /// <summary>Holds AgenticLoop before its NEXT round starts (see IsPaused).</summary>
-    public void Pause() => _isPaused = true;
+    /// <summary>Hold (on=true) or release (on=false) the NEXT round on behalf of owner. Only touches owner's own hold.</summary>
+    public void SetHold(object owner, bool on)
+    {
+        lock (_holdLock)
+        {
+            if (on) _holds.Add(owner);
+            else    _holds.Remove(owner);
+        }
+    }
 
-    /// <summary>Releases a previously-set Pause (see IsPaused).</summary>
-    public void Resume() => _isPaused = false;
+    public bool HasHold(object owner)
+    {
+        lock (_holdLock) return _holds.Contains(owner);
+    }
 
     public void SetUserPaused(bool paused) => _isUserPaused = paused;
+
+    private int _activeSubAgents = 0;
+
+    /// <summary>How many dispatched sub agents are running for this session right now. Info only — it does NOT pause anything.</summary>
+    public int ActiveSubAgentCount => Volatile.Read(ref _activeSubAgents);
+
+    public void BeginSubAgentRun() => Interlocked.Increment(ref _activeSubAgents);
+
+    public void EndSubAgentRun()
+    {
+        // Never go below zero.
+        int cur;
+        do { cur = Volatile.Read(ref _activeSubAgents); if (cur <= 0) return; }
+        while (Interlocked.CompareExchange(ref _activeSubAgents, cur - 1, cur) != cur);
+    }
 
     private volatile bool _isPauseActive = false;
 
@@ -204,6 +320,7 @@ public sealed class ChatSessionRuntime : IPromptInjectionQueue
         CurrentRoundRecord       = null;
         CurrentRoundStopwatch    = null;
         CurrentCancelAttempt     = null;
+        Interlocked.Exchange(ref _activeSubAgents, 0); // a cancelled turn never calls EndSubAgentRun
 
         IsProcessing = false;
     }

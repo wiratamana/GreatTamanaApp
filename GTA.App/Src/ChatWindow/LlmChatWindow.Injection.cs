@@ -16,38 +16,43 @@ public partial class LlmChatWindow
 {
     // ── Popup wiring ──────────────────────────────────────────────────────
 
-    /// <summary>Opens the "💉 Inject" popup for whichever session is currently active.</summary>
-    private async void OpenInjectionWindow()
+    /// <summary>One open queue window per session (so a second click just brings it to the front).</summary>
+    private readonly Dictionary<string, PromptInjectionWindow> _injectionWindows = new();
+
+    /// <summary>
+    /// Opens the "💉 Injection queue" window for the active session. The window is NOT modal.
+    /// It holds the session's next round ONLY through its own hold (see ChatSessionRuntime.SetHold),
+    /// so nothing else (a sub agent finishing, ...) can release it by accident.
+    /// </summary>
+    private void OpenInjectionWindow()
     {
         var session = _current;
         if (session == null) return;
 
-        session.Runtime.Pause();
-        RefreshInjectButtonLabel();
-
-        try
+        if (_injectionWindows.TryGetValue(session.Id, out var existing))
         {
-            var popup = new PromptInjectionWindow(
-                session.Title,
-                injection => EnqueueInjectionForSession(session, injection));
-
-            await popup.ShowDialog(this);
+            existing.WindowState = WindowState.Normal;
+            existing.Activate();
+            return;
         }
-        finally
+
+        var popup = new PromptInjectionWindow(
+            session.Title,
+            session.Runtime,
+            RefreshInjectButtonLabel);
+
+        _injectionWindows[session.Id] = popup;
+        popup.Closed += (_, _) =>
         {
-            session.Runtime.Resume();
+            _injectionWindows.Remove(session.Id);
             RefreshInjectButtonLabel();
-        }
-    }
+        };
 
-    /// <summary>Queue a submitted injection onto session's own ChatSessionRuntime</summary>
-    private void EnqueueInjectionForSession(ChatSession session, PendingInjection injection)
-    {
-        session.Runtime.EnqueueInjection(injection);
+        popup.Show(this);
         RefreshInjectButtonLabel();
     }
 
-    /// <summary>Updates the "💉 Inject (N)" header button label for the active session.</summary>
+    /// <summary>Updates the "💉 Inject (N)" header button label + tooltip for the active session.</summary>
     internal void RefreshInjectButtonLabel()
     {
         if (!Dispatcher.UIThread.CheckAccess())
@@ -65,6 +70,23 @@ public partial class LlmChatWindow
         string label = count > 0 ? $"💉 Inject ({count})" : "💉 Inject";
         if (paused) label += " ⏸";
         _injectButton.Content = label;
+
+        // Tooltip shows what is queued, so the user can SEE it without opening the window.
+        string tip = "Open the injection queue: add, edit or remove messages for the AI's next round.";
+        if (runtime != null && count > 0)
+        {
+            var items = runtime.SnapshotPending();
+            var lines = items.Take(5).Select((p, i) =>
+            {
+                string t = string.IsNullOrWhiteSpace(p.Text) ? "(attachments / tools)" : p.Text.Trim().Replace('\r', ' ').Replace('\n', ' ');
+                if (t.Length > 80) t = t[..80] + "…";
+                return $"#{i + 1}  {t}";
+            });
+            tip = $"{count} message(s) waiting:\n" + string.Join("\n", lines) +
+                  (items.Count > 5 ? $"\n… +{items.Count - 5} more" : "") +
+                  "\n\nClick to edit or remove.";
+        }
+        ToolTip.SetTip(_injectButton, tip);
     }
 
     // ── Live rendering (called by AvaloniaAgentLogger.LogInjection) ──────────
@@ -80,7 +102,6 @@ public partial class LlmChatWindow
         var runtime = session.Runtime;
 
         StackPanel targetPanel = RoundTarget(runtime, runtime.CurrentTurnContentPanel ?? BeginTurnBubble(session));
-
         var display = new DisplayPromptInjection
         {
             Text            = injection.Text,

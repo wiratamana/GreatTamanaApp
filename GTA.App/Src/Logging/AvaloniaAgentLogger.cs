@@ -171,6 +171,9 @@ public sealed class AvaloniaAgentLogger : IAgentLogger
 
     public bool LastCallExceededContextLength { get; set; }
 
+    /// <summary>This session's pause gate. A dispatched sub agent checks it before every round.</summary>
+    public IPromptInjectionQueue? PauseGate => _session.Runtime;
+
     /// <summary>Remembers the twin session (and its own task text) created by BeginSubAgentDispatch so EndSubAgentDispatch knows which one to finalize.</summary>
     private (ChatSession Twin, string Task)? _subAgentDispatch;
 
@@ -182,7 +185,7 @@ public sealed class AvaloniaAgentLogger : IAgentLogger
 
         void DoWork()
         {
-            _session.Runtime.Pause();
+            _session.Runtime.BeginSubAgentRun(); // info only — does NOT touch any pause/hold
             _window.RefreshInjectButtonLabel();
 
             twin = _window.CreateSubAgentTwinSession(_session, task, modelName);
@@ -215,7 +218,7 @@ public sealed class AvaloniaAgentLogger : IAgentLogger
             _window.FinishSubAgentTwinSession(twin, success, message);
             _window.AddSubAgentDispatchWidget(_session, twin.Id, task, success, message);
 
-            _session.Runtime.Resume();
+            _session.Runtime.EndSubAgentRun();   // BUG FIX: used to call Resume() and wipe the inject popup's pause
             _window.RefreshInjectButtonLabel();
 
             doneSignal.Set();
