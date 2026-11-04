@@ -1,0 +1,75 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <OutputType>WinExe</OutputType>
+    <Nullable>enable</Nullable>
+    <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <PublishTrimmed>false</PublishTrimmed>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia"                Version="11.3.12" />
+    <PackageReference Include="Avalonia.Desktop"        Version="11.3.12" />
+    <PackageReference Include="Avalonia.Themes.Fluent"  Version="11.3.12" />
+    <PackageReference Include="Avalonia.Fonts.Inter"    Version="11.3.11" />
+    <PackageReference Include="Avalonia.Diagnostics"    Version="11.3.11">
+      <IncludeAssets Condition="'$(Configuration)' != 'Debug'">None</IncludeAssets>
+      <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\GTA.Core\GTA.Core.csproj" />
+    <ProjectReference Include="..\GTA.Builder\GTA.Builder.csproj" />
+    <ProjectReference Include="..\GTA.Tools\GTA.Tools.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="Config\model_pricing.ini">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <!-- Co-worker build: the developer's init.ini (real secrets!) is NEVER copied. tools\Pack-CoWorkerConfig.ps1 writes a sanitized one (see target below). -->
+    <Content Include="Config\init.ini" Condition="'$(CoWorkerUse)' != 'true' And Exists('Config\init.ini')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Config\init.ini.example" Condition="Exists('Config\init.ini.example')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <!--
+    CO_WORKER_USE post-build / post-publish step: split the developer's init.ini into
+      Config\init.ini                         plain text, non-sensitive keys only
+      Credentials\my_credentials.dat          AES-256 encrypted JSON (azure_key, azure_anthropic_endpoint, empty user credentials)
+    Removed from the co-worker build: gemini_api_key, azure_cognitive_endpoint, github_pat. Details: tools\Pack-CoWorkerConfig.ps1
+    A failure here FAILS the build on purpose (never ship a build without a sanitized config).
+  -->
+  <PropertyGroup Condition="'$(CoWorkerUse)' == 'true'">
+    <_CwPackTool>$(MSBuildThisFileDirectory)..\tools\Pack-CoWorkerConfig.ps1</_CwPackTool>
+  </PropertyGroup>
+
+  <Target Name="CoWorkerPackConfigAfterBuild" AfterTargets="Build" Condition="'$(CoWorkerUse)' == 'true'">
+    <PropertyGroup>
+      <_CwBuildDir>$([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)', '$(OutDir)'))</_CwBuildDir>
+      <_CwBuildDir>$(_CwBuildDir.TrimEnd('\'))</_CwBuildDir>
+    </PropertyGroup>
+    <Exec Command="powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File &quot;$(_CwPackTool)&quot; -OutDir &quot;$(_CwBuildDir)&quot;" />
+  </Target>
+
+  <Target Name="CoWorkerPackConfigAfterPublish" AfterTargets="Publish" Condition="'$(CoWorkerUse)' == 'true'">
+    <PropertyGroup>
+      <_CwPublishDir>$([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)', '$(PublishDir)'))</_CwPublishDir>
+      <_CwPublishDir>$(_CwPublishDir.TrimEnd('\'))</_CwPublishDir>
+    </PropertyGroup>
+    <!-- -Ship: the publish folder goes to co-workers, so user credentials are always written EMPTY there. -->
+    <Exec Command="powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File &quot;$(_CwPackTool)&quot; -OutDir &quot;$(_CwPublishDir)&quot; -Ship" />
+  </Target>
+
+</Project>

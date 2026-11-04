@@ -1,0 +1,96 @@
+; Copy to init.ini and fill in. init.ini is gitignored.
+; Format: key = "value" (quote-aware, ; and # start comments outside quotes).
+
+; GitHub PAT used by git online tools (repo scope)
+github_pat = ""
+
+; Azure AI Foundry API key
+azure_key = ""
+
+; Google Gemini API key
+gemini_api_key = ""
+
+; Jira login for the REST API: Atlassian account email + API token (Basic auth). Read by CredentialManager (name "JiraApiToken").
+cred_jiraapitoken_id = ""
+cred_jiraapitoken_password = ""
+
+; Local git repository polled by the Issue Watcher (LlmChatWindow.IssueWatcher.cs)
+path_issue_watcher_repo = ""
+
+; Azure AI Foundry Anthropic endpoint (AppConfig.AZURE_BASE)
+azure_anthropic_endpoint = ""
+
+; Azure cognitive services endpoint for GPT Responses API (AppConfig.GPT_BASE)
+azure_cognitive_endpoint = ""
+
+; Primary account (proxy / SSO login)
+cred_primaryaccount_id = ""
+
+cred_primaryaccount_password = ""
+
+; Mail account (cloud login)
+cred_mailaccount_id = ""
+
+cred_mailaccount_password = ""
+
+; Box enterprise host (BoxApiClient.BoxHost, used by Box tools and BoxSession)
+box_enterprise_host = ""
+
+; Box account/SSO host (BoxApiClient.AccountHost, used by BoxSession)
+box_account_host = ""
+
+; Sender address of the IBM Cloud one-time-password email (IbmCloudAutoLoginClient.OtpSenderAddress)
+ibm_otp_sender_address = ""
+
+; IBM Cloud account id used by CoralogixLoginClient (default AccountId)
+ibm_account_id = ""
+
+; IBM Cloud Logs service-instance GUID, JP production (IbmCloudLogsApiClient.cs, IbmCloudEnvironments)
+ibm_jp_prod_tenant_id = ""
+
+; Coralogix team id, JP production
+ibm_jp_prod_team_id = ""
+
+; IBM Cloud Logs service-instance GUID, JP pre-production (also default ServiceInstanceId in CoralogixLoginCl...
+ibm_jp_preprod_tenant_id = ""
+
+; Coralogix team id, JP pre-production (also default TeamId in CoralogixLoginClient)
+ibm_jp_preprod_team_id = ""
+
+; IBM Cloud Logs service-instance GUID, EU production
+ibm_eu_prod_tenant_id = ""
+
+; Coralogix team id, EU production
+ibm_eu_prod_team_id = ""
+
+; IBM Cloud Logs service-instance GUID, EU pre-production
+ibm_eu_preprod_tenant_id = ""
+
+; Coralogix team id, EU pre-production
+ibm_eu_preprod_team_id = ""
+
+; Extra hosts (comma separated) that may receive the Coralogix token in IbmCloudLogsApiClient.Get/Post (RawGe...
+ibm_allowed_hosts = ""
+
+; Default Jira tenant base URL (GTA.Tools Jira tools: Tools.Jira.cs, ReadTicket, WriteComment)
+jira_base_url = ""
+
+; ---- jira_read_ticket field profiles (the app code knows no project keys and no custom field ids) ----
+; Standard fields (summary, status, comment, ...) are always read. Everything below is extra.
+; Field ids are comma separated. Field labels are taken from Jira itself.
+
+; Extra field ids read for EVERY project
+jira_common_fields = ""
+
+; Profile n (n = 1, 2, 3 ... up to 50): used when the ticket's project key is in _projects (comma separated)
+jira_profile_1_projects = ""
+jira_profile_1_title = ""
+jira_profile_1_fields = ""
+
+jira_profile_2_projects = ""
+jira_profile_2_title = ""
+jira_profile_2_fields = ""
+
+; Used for any project key that is not listed in a profile above
+jira_profile_default_title = ""
+jira_profile_default_fields = ""

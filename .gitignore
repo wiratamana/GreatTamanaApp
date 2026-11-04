@@ -1,0 +1,52 @@
+# Build output
+bin/
+obj/
+publish/
+.vs/
+*.user
+*.suo
+
+# Secrets and local config (real values live here)
+**/Config/init.ini
+**/Config/secret.ini
+**/Config/credentials.ini
+*.secret.ini
+.env
+.env.*
+
+# Local build secrets (NEVER commit)
+build_secrets/
+
+# Runtime data written next to the exe
+Credentials/
+ForTesting/
+sessions/
+logs/
+Evidence/
+BugReports/
+encyclopedia_kb/
+Screenshots/
+NetworkLogs*/
+
+# Misc
+*.bak
+*.orig
+*.log
+*.tmp
+Thumbs.db
+
+# Extra safety net: key / certificate / encrypted-credential files and editor folders
+*.key
+*.pfx
+*.p12
+*.pem
+*.dat
+*.g.cs
+.vscode/
+.idea/
+TestResults/
+
+# Local-only scripts and notes (not published)
+*.ps1
+tools/
+*.local.md

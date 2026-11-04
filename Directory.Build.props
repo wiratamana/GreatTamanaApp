@@ -1,0 +1,27 @@
+<Project>
+  <PropertyGroup>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <PathMap>$(MSBuildThisFileDirectory)=/src/</PathMap>
+  </PropertyGroup>
+
+  <!--
+    CO_WORKER_USE build: safe edition for co-workers.
+      Build:    dotnet build GTA.slnx -c Release -p:CoWorkerUse=true
+      Publish:  dotnet publish GTA.App -c Release -p:CoWorkerUse=true
+    Removed in this build (compiled out with "#if !CO_WORKER_USE"):
+      - Issue Watcher (path_issue_watcher_repo, Start Issue Watcher button) and ALL git tools
+      - gcc, cmake, inline_python, run_shell, run_app_background, stop_app_background
+      - dotnet_* tools, avalonia_* tools
+      - TCP command server (127.0.0.1:9876), the only client of the avalonia_* tools
+      - agents: code_specialist, avalonia_specialist
+    Kept: basic IO, jira, ibm cloud, box, xlsx, pptx, encyclopedia, bug_report, http_request (loopback only), gte.
+    This build uses its own bin\CoWorker and obj\CoWorker folders, so it never mixes with the normal build.
+  -->
+  <PropertyGroup Condition="'$(CoWorkerUse)' == 'true'">
+    <DefineConstants>$(DefineConstants);CO_WORKER_USE</DefineConstants>
+    <BaseIntermediateOutputPath>$(MSBuildProjectDirectory)\obj\CoWorker\</BaseIntermediateOutputPath>
+    <BaseOutputPath>$(MSBuildProjectDirectory)\bin\CoWorker\</BaseOutputPath>
+    <DefaultItemExcludes>$(DefaultItemExcludes);obj\**;bin\**</DefaultItemExcludes>
+  </PropertyGroup>
+</Project>

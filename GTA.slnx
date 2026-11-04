@@ -1,0 +1,9 @@
+<Solution>
+  <Project Path="GTA.App/GTA.App.csproj" />
+  <Project Path="GTA.Builder/GTA.Builder.csproj" />
+  <Project Path="GTA.Core/GTA.Core.csproj" />
+  <Project Path="GTA.Tools/GTA.Tools.csproj" />
+  <Project Path="GTA.Tools.Impl/GTA.Tools.Impl.csproj" />
+  <Project Path="GTA.DocxLib/GTA.DocxLib.csproj" />
+  <Project Path="GTA.PptxLib/GTA.PptxLib.csproj" />
+</Solution>
