@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -24,8 +25,28 @@ namespace GTA.Core
             "write_file", "append_to_file", "edit_line", "insert_line", "replace_in_file", "remove_line",
         };
 
+        /// <summary>
+        /// Marker key a caller can set (to true) on one message object. BuildPayload turns it into an extra
+        /// prompt-cache breakpoint on that message's last block, then removes the key.
+        /// Why: Anthropic refreshes the 5-minute cache TTL of EVERY explicit breakpoint on every request.
+        /// A dispatched Sub Agent can run 40+ minutes. Without a pin, the parent's conversation prefix
+        /// expires during that time and the parent re-writes its whole history after the Sub Agent reports.
+        /// </summary>
+        public const string CachePinKey = "_cache_pin";
+
         // Set once if the API answers 400 because of eager_input_streaming.
         private static volatile bool _eagerStreamingRejected;
+
+        // Set once if the API answers 400 because of the 1-hour cache TTL ("ttl": "1h"). Then we stay on 5 minutes.
+        private static volatile bool _ttl1hRejected;
+
+        /// <summary>A fresh cache_control object (a JsonNode can only have ONE parent, so never share one instance).</summary>
+        private static JsonObject MakeCacheControl(bool ttl1h)
+        {
+            var cc = new JsonObject { ["type"] = "ephemeral" };
+            if (ttl1h) cc["ttl"] = "1h";
+            return cc;
+        }
         public static async Task<JsonObject?> CallAzureAsync(
             JsonArray         messages,
             JsonArray         tools,
@@ -62,17 +83,21 @@ namespace GTA.Core
                     await Task.Delay(AppConfig.RETRY_DELAY_MS, ct);
 
                 SseParseResult? parseResult = null;
+                bool            ttl1hSent   = false;   // did THIS attempt's request carry the 1-hour cache TTL?
 
                 try
                 {
                     bool eagerSent = !_eagerStreamingRejected;
-                    string jsonBody = BuildPayload(activeMessages, tools, systemPrompt, maxTokens, thinking, effort, eagerSent)
-                                          .ToJsonString();
+                    ttl1hSent = AppConfig.CACHE_TTL_1H && !_ttl1hRejected;
+                    // The body is STREAMED message by message into the request (no byte[] of the whole history, which
+                    // for a chat with screenshots is tens of MB and sits in the Large Object Heap). The length is
+                    // counted in a first pass that writes nothing, so the request still has a normal Content-Length.
+                    JsonObject payloadNode = BuildPayload(activeMessages, tools, systemPrompt, maxTokens, thinking, effort, eagerSent, ttl1hSent);
+                    long payloadBytes = MeasurePayload(payloadNode);
 
                     
                     HttpClient client = _sharedProxyClient.Value; // shared/reused — do NOT dispose
 
-                    long payloadBytes = Encoding.UTF8.GetByteCount(jsonBody);
                     timeStamp = System.Diagnostics.Stopwatch.GetTimestamp();
                     logger.LogInfo($"Starting SendAsync (payload: {payloadBytes / 1024.0:F1} KB)");
                     // ResponseHeadersRead: SendAsync returns as soon as HTTP headers
@@ -98,7 +123,7 @@ namespace GTA.Core
                             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", AppConfig.AZURE_KEY);
                             request.Headers.Add("anthropic-version", "2023-06-01");
                             request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
-                            request.Content = new TimedStringContent(jsonBody, Encoding.UTF8, "application/json", logger);
+                            request.Content = new TimedJsonContent(payloadNode, payloadBytes, logger);
 
                             response = await client.SendAsync(
                                 request, HttpCompletionOption.ResponseHeadersRead, attemptCts.Token);
@@ -152,11 +177,25 @@ namespace GTA.Core
 
                     if (!response.IsSuccessStatusCode)
                     {
-                        if (eagerSent && response.StatusCode == HttpStatusCode.BadRequest)
+                        if ((eagerSent || ttl1hSent) && response.StatusCode == HttpStatusCode.BadRequest)
                         {
                             string badBody = await response.Content.ReadAsStringAsync();
-                            if (badBody.Contains("eager_input_streaming", StringComparison.OrdinalIgnoreCase) ||
-                                badBody.Contains("Extra inputs are not permitted", StringComparison.OrdinalIgnoreCase))
+
+                            // Check the 1-hour TTL FIRST: its error text can also say "Extra inputs are not permitted".
+                            if (ttl1hSent &&
+                                (badBody.Contains("ttl", StringComparison.OrdinalIgnoreCase) ||
+                                 badBody.Contains("cache_control", StringComparison.OrdinalIgnoreCase)))
+                            {
+                                _ttl1hRejected = true;
+                                logger.LogWarning("[cache ttl 1h] rejected by the API — falling back to the 5-minute cache TTL for the rest of this run. " +
+                                                  "(Server said: " + TryExtractError(badBody) + ")");
+                                attempt--;       // do not burn a retry for this
+                                continue;
+                            }
+
+                            if (eagerSent &&
+                                (badBody.Contains("eager_input_streaming", StringComparison.OrdinalIgnoreCase) ||
+                                 badBody.Contains("Extra inputs are not permitted", StringComparison.OrdinalIgnoreCase)))
                             {
                                 _eagerStreamingRejected = true;
                                 logger.LogWarning("[eager_input_streaming] rejected by the API — retrying without live tool-input streaming.");
@@ -213,6 +252,11 @@ namespace GTA.Core
                     var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(timeStamp);
                     logger.LogInfo($"Http call error. Took: {elapsed.TotalMilliseconds}ms. | Msg: {exMsg}");
                 }
+                // STOP button: the catch above swallows every exception (it is the retry logic), and the stream parser
+                // may return a half result when it is cancelled. Without this line a stop was handled like a network
+                // error: retry, or "return null" (= the loop treats it as a failed call). Always stop for real.
+                ct.ThrowIfCancellationRequested();
+
 
                 // ── Success ───────────────────────────────────────────────────────
                 if (parseResult != null && !parseResult.WasInterrupted)
@@ -224,6 +268,19 @@ namespace GTA.Core
                     if (partialTexts != null)
                         SseStreamParser.MergePartialTexts(contentBlocks, partialTexts);
 
+                    // 1-hour TTL bookkeeping (for pricing + the round badge in the UI).
+                    int  write   = parseResult.CacheCreationInputTokens;
+                    int  write1h = parseResult.CacheCreation1hInputTokens;
+                    // Request carried ttl=1h and was accepted, but the API sent no 5m/1h split: treat every write as 1h.
+                    if (ttl1hSent && !parseResult.CacheCreationBreakdownSeen) write1h = write;
+                    write1h = Math.Clamp(write1h, 0, write);
+                    // The server wrote tokens but NONE as 1h although we asked for 1h => it silently ignored the TTL.
+                    bool ttl1hUsed = ttl1hSent && !(parseResult.CacheCreationBreakdownSeen && write > 0 && write1h == 0);
+                    logger.LogInfo(
+                        $"[cache] ttl requested={(ttl1hSent ? "1h" : "5m")} | write={write:N0} (1h part={write1h:N0}, " +
+                        $"split reported by API={parseResult.CacheCreationBreakdownSeen}) | read={parseResult.CacheReadInputTokens:N0}" +
+                        (ttl1hSent && !ttl1hUsed ? " | WARNING: API wrote the cache as 5m although 1h was requested" : ""));
+
                     return new JsonObject
                     {
                         ["stop_reason"] = parseResult.StopReason,
@@ -231,10 +288,12 @@ namespace GTA.Core
                         // Embed token usage so AgenticLoop can accumulate and log it.
                         ["usage"]       = new JsonObject
                         {
-                            ["input_tokens"]                = parseResult.InputTokens,
-                            ["output_tokens"]               = parseResult.OutputTokens,
-                            ["cache_creation_input_tokens"] = parseResult.CacheCreationInputTokens,
-                            ["cache_read_input_tokens"]     = parseResult.CacheReadInputTokens
+                            ["input_tokens"]                   = parseResult.InputTokens,
+                            ["output_tokens"]                  = parseResult.OutputTokens,
+                            ["cache_creation_input_tokens"]    = write,
+                            ["cache_creation_1h_input_tokens"] = write1h,
+                            ["cache_read_input_tokens"]        = parseResult.CacheReadInputTokens,
+                            ["cache_ttl_1h"]                   = ttl1hUsed
                         }
                     };
                 }
@@ -327,6 +386,164 @@ namespace GTA.Core
             return null;
         }
 
+        // Keep-alive is switched off for the run after 3 API rejections IN A ROW (a success resets the counter).
+        private static volatile bool _keepAliveRejected;
+        private static int           _keepAliveRejectCount;
+
+        /// <summary>True after 3 rejected pings in a row: no more pings this run.</summary>
+        public static bool KeepAliveDisabled => _keepAliveRejected;
+
+        /// <summary>Reason of the last failed ping (null when the last ping was fine). Shown in the GUI.</summary>
+        public static volatile string? LastKeepAliveError;
+
+        /// <summary>
+        /// CACHE KEEP-ALIVE ping. Used while a long tool (cmake, tests, CLI) runs, so the 5-minute prompt cache of the
+        /// conversation does not expire. <paramref name="messages"/> is the live history and still ENDS with the
+        /// assistant tool_use message that has no tool_result yet. We drop that message, so the request is the same
+        /// prefix the last real call used (same tools, system, thinking settings => same cache key).
+        /// A pin breakpoint is put on the last user message. The first ping therefore writes that one message
+        /// (the real next call would have written it anyway). Every later ping is a pure cache READ.
+        /// max_tokens is tiny, so the output cost is nearly zero. The answer is thrown away.
+        /// Returns the usage of the ping, or null when nothing was sent or it failed. Never throws for API errors.
+        /// </summary>
+        public static async Task<TokenUsage?> KeepCacheWarmAsync(
+            JsonArray         messages,
+            JsonArray         tools,
+            string            systemPrompt,
+            string            thinking,
+            string            effort,
+            IAgentLogger      logger,
+            CancellationToken ct = default)
+        {
+            if (_keepAliveRejected) return null;
+            LastKeepAliveError = null;   // so an old error is never shown for a ping that was not even sent
+            if (messages.Count < 2) return null;
+            if (messages[messages.Count - 1]?["role"]?.GetValue<string>() != "assistant") return null;
+
+            // Snapshot (deep clone) without the unanswered assistant message. Never touch the live array.
+            var snapshot = new JsonArray();
+            for (int i = 0; i < messages.Count - 1; i++)
+                snapshot.Add(messages[i]?.DeepClone());
+
+            if (snapshot[snapshot.Count - 1] is not JsonObject lastUser ||
+                lastUser["role"]?.GetValue<string>() != "user")
+                return null;
+
+            // The API allows MAX 4 cache_control blocks per request. BuildPayload already adds: system (1) + last tool (1)
+            // + one per message that carries the pin marker (a Sub Agent history has one: the shared parent prefix)
+            // + the rolling one (1). Only add MY pin on the last message when there is still room. Without this check
+            // a Sub Agent ping had 5 blocks and the API answered HTTP 400.
+            int pins = 0;
+            foreach (JsonNode? m in snapshot)
+            {
+                if (m is JsonObject mo && mo[CachePinKey] is JsonValue pv && pv.TryGetValue(out bool isPinned) && isPinned)
+                    pins++;
+            }
+            int toolBlocks = 0;
+            foreach (JsonNode? t in tools)
+            {
+                if (t is JsonObject to && !to.ContainsKey("type")) { toolBlocks = 1; break; }
+            }
+            int breakpointsWithoutMine = 1 + toolBlocks + pins + 1;
+            if (breakpointsWithoutMine < 4)
+                lastUser[CachePinKey] = true;   // BuildPayload turns this into a real breakpoint and removes the key
+            // else: no room. The ping is then the same request as a normal call. The last message is billed as plain input.
+
+            bool ttl1h = AppConfig.CACHE_TTL_1H && !_ttl1hRejected;
+            JsonObject pingPayload = BuildPayload(
+                snapshot, tools, systemPrompt, 16, thinking, effort, !_eagerStreamingRejected, ttl1h);
+
+            try
+            {
+                string url = AppConfig.AZURE_BASE.TrimEnd('/') + "/v1/messages";
+
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                cts.CancelAfter(TimeSpan.FromSeconds(90));
+
+                using var request = new HttpRequestMessage(HttpMethod.Post, url);
+                request.Options.Set(LoggerOptionKey, logger);
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", AppConfig.AZURE_KEY);
+                request.Headers.Add("anthropic-version", "2023-06-01");
+                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
+                request.Content = new TimedJsonContent(pingPayload, MeasurePayload(pingPayload), null);
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                using HttpResponseMessage response = await _sharedProxyClient.Value.SendAsync(
+                    request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    string errBody = await response.Content.ReadAsStringAsync(cts.Token);
+                    int code = (int)response.StatusCode;
+                    // One bad ping (for example a conversation with too many breakpoints) must not kill keep-alive for
+                    // the whole run. Only 3 rejections in a row switch it off.
+                    if (code >= 400 && code < 500 && code != 408 && code != 429)
+                        _keepAliveRejectCount++;
+                    bool off = _keepAliveRejectCount >= 3;
+                    if (off) _keepAliveRejected = true;
+                    LastKeepAliveError = $"HTTP {code}: {TryExtractError(errBody)}";
+                    logger.LogWarning($"[cache keep-alive] ping failed: HTTP {code}: {TryExtractError(errBody)}" +
+                                      (off ? " — keep-alive is switched OFF for the rest of this run (3 rejections in a row)." : ""));
+                    return null;
+                }
+
+                _keepAliveRejectCount = 0;
+                LastKeepAliveError    = null;
+                string sse = await response.Content.ReadAsStringAsync(cts.Token);
+
+                int inTok = 0, outTok = 0, write = 0, write1h = 0, read = 0;
+                foreach (string rawLine in sse.Split('\n'))
+                {
+                    string line = rawLine.Trim();
+                    if (!line.StartsWith("data:", StringComparison.Ordinal)) continue;
+
+                    JsonNode? ev;
+                    try { ev = JsonNode.Parse(line.Substring(5).Trim()); }
+                    catch { continue; }
+
+                    string? type = ev?["type"]?.GetValue<string>();
+                    if (type == "message_start")
+                    {
+                        JsonNode? u = ev?["message"]?["usage"];
+                        inTok   = u?["input_tokens"]?.GetValue<int>()                ?? 0;
+                        write   = u?["cache_creation_input_tokens"]?.GetValue<int>() ?? 0;
+                        read    = u?["cache_read_input_tokens"]?.GetValue<int>()     ?? 0;
+                        write1h = u?["cache_creation"]?["ephemeral_1h_input_tokens"]?.GetValue<int>() ?? 0;
+                    }
+                    else if (type == "message_delta")
+                    {
+                        outTok = ev?["usage"]?["output_tokens"]?.GetValue<int>() ?? outTok;
+                    }
+                }
+
+                write1h = Math.Clamp(write1h, 0, write);
+                logger.LogInfo(
+                    $"[cache keep-alive] ping ok in {sw.Elapsed.TotalSeconds:F1}s | read={read:N0} write={write:N0} " +
+                    $"uncached-in={inTok:N0} out={outTok:N0}" +
+                    (read == 0 ? " | WARNING: nothing was read from the cache — it was probably already expired" : ""));
+
+                return new TokenUsage
+                {
+                    InputTokens                = inTok,
+                    OutputTokens               = outTok,
+                    CacheCreationInputTokens   = write,
+                    CacheCreation1hInputTokens = write1h,
+                    CacheReadInputTokens       = read,
+                    CacheTtl1h                 = ttl1h && write1h > 0,
+                };
+            }
+            catch (OperationCanceledException)
+            {
+                return null;   // tool finished (or the user cancelled) while the ping was in flight
+            }
+            catch (Exception ex)
+            {
+                LastKeepAliveError = ex.Message;
+                logger.LogWarning($"[cache keep-alive] ping failed: {ex.Message}");
+                return null;
+            }
+        }
+
         /// <summary>Assemble the full JSON request body for one API call.</summary>
         private static JsonObject BuildPayload(
             JsonArray activeMessages,
@@ -335,7 +552,8 @@ namespace GTA.Core
             int       maxTokens,
             string    thinking,
             string    effort,
-            bool      eagerToolStreaming = false)
+            bool      eagerToolStreaming = false,
+            bool      ttl1h              = false)
         {
             // ── Clone so we never mutate the caller's live arrays ─────────────────
             JsonArray clonedMessages = activeMessages.DeepClone().AsArray();
@@ -361,26 +579,39 @@ namespace GTA.Core
                 }
             }
 
+            // TTL rule of the API: a 1-hour breakpoint must not come AFTER a 5-minute one (order: tools, system, messages).
+            // So when ttl1h is on, EVERY breakpoint below is 1h; when off, every breakpoint is the 5-minute default.
             var systemBlock = new JsonArray
             {
                 new JsonObject
                 {
                     ["type"]          = "text",
                     ["text"]          = systemPrompt,
-                    ["cache_control"] = new JsonObject { ["type"] = "ephemeral" }
+                    ["cache_control"] = MakeCacheControl(ttl1h)
                 }
             };
 
             if (clonedTools.Count > 0)
-                clonedTools[clonedTools.Count - 1]!.AsObject()["cache_control"] =
-                    new JsonObject { ["type"] = "ephemeral" };
+                clonedTools[clonedTools.Count - 1]!.AsObject()["cache_control"] = MakeCacheControl(ttl1h);
+
+            // ── Pinned breakpoint (see CachePinKey) ───────────────────────────────
+            // A message may carry the marker CachePinKey. We turn it into a real cache breakpoint
+            // and ALWAYS remove the marker, so it never reaches the API.
+            // Total breakpoints stay <= 4: system + tools + pin + rolling.
+            foreach (JsonNode? m in clonedMessages)
+            {
+                if (m is not JsonObject mo || !mo.ContainsKey(CachePinKey)) continue;
+                bool pinned = mo[CachePinKey] is JsonValue pv && pv.TryGetValue(out bool b) && b;
+                mo.Remove(CachePinKey);
+                if (pinned) AddCacheBreakpoint(mo, ttl1h);
+            }
 
             if (clonedMessages.Count > 0)
             {
                 int cacheIdx = clonedMessages.Count >= 2
                     ? clonedMessages.Count - 2
                     : 0;
-                AddCacheBreakpoint(clonedMessages[cacheIdx]!.AsObject());
+                AddCacheBreakpoint(clonedMessages[cacheIdx]!.AsObject(), ttl1h);
             }
 
             // ── Build the payload ─────────────────────────────────────────────────
@@ -414,10 +645,10 @@ namespace GTA.Core
         }
 
         /// <summary>Attach an Anthropic prompt-cache breakpoint to the last content block of <paramref name="message"/>.</summary>
-        private static void AddCacheBreakpoint(JsonObject message)
+        private static void AddCacheBreakpoint(JsonObject message, bool ttl1h)
         {
             JsonNode? content = message["content"];
-            var cc = new JsonObject { ["type"] = "ephemeral" };
+            JsonObject cc = MakeCacheControl(ttl1h);
 
             // String shorthand (e.g. simple user turn) → convert to block array.
             if (content is JsonValue strVal && strVal.TryGetValue<string>(out string? text))
@@ -461,7 +692,10 @@ namespace GTA.Core
             }
         }
 
-        private static readonly HttpDiagnosticsEventListener _netDiagListener = new();
+        // Only in verbose mode: an EventListener on System.Net.* makes the runtime build an event object for EVERY
+        // network event (allocations, and it keeps the event sources busy) — pure waste when nothing is logged.
+        private static readonly HttpDiagnosticsEventListener? _netDiagListener =
+            SessionFileLogger.IsVerbose ? new HttpDiagnosticsEventListener() : null;
         /// <summary>Shared, long-lived HttpClient + handler reused across EVERY call and EVERY retry for the lifetime of the process.</summary>
         private static readonly Lazy<HttpClient> _sharedProxyClient = new(() =>
         {
@@ -584,25 +818,88 @@ namespace GTA.Core
                 _ = t.ContinueWith(x => { _ = x.Exception; }, TaskContinuationOptions.ExecuteSynchronously);
         }
 
-        private sealed class TimedStringContent : StringContent
+        /// <summary>
+        /// The request body, as UTF-8 JSON, one message at a time. Yields the bytes written so far after every message;
+        /// the caller sends them and clears <paramref name="buf"/>. Same JSON as serializing the whole payload at once,
+        /// but the biggest buffer is one message, not the whole history.
+        /// </summary>
+        private static IEnumerable<ReadOnlyMemory<byte>> PayloadChunks(JsonObject payload, ArrayBufferWriter<byte> buf)
         {
+            using var w = new Utf8JsonWriter(buf);
+            w.WriteStartObject();
+            foreach (KeyValuePair<string, JsonNode?> kv in payload)
+            {
+                w.WritePropertyName(kv.Key);
+                if (kv.Key == "messages" && kv.Value is JsonArray messages)
+                {
+                    w.WriteStartArray();
+                    foreach (JsonNode? m in messages)
+                    {
+                        if (m == null) w.WriteNullValue();
+                        else           m.WriteTo(w);
+                        w.Flush();
+                        yield return buf.WrittenMemory;
+                    }
+                    w.WriteEndArray();
+                }
+                else if (kv.Value == null) w.WriteNullValue();
+                else                       kv.Value.WriteTo(w);
+            }
+            w.WriteEndObject();
+            w.Flush();
+            yield return buf.WrittenMemory;
+        }
+
+        /// <summary>Exact byte length of the payload (a counting pass: nothing is kept).</summary>
+        private static long MeasurePayload(JsonObject payload)
+        {
+            var  buf   = new ArrayBufferWriter<byte>(64 * 1024);
+            long total = 0;
+            foreach (ReadOnlyMemory<byte> chunk in PayloadChunks(payload, buf))
+            {
+                total += chunk.Length;
+                buf.Clear();
+            }
+            return total;
+        }
+
+        /// <summary>The JSON request body, streamed straight into the connection (see PayloadChunks).</summary>
+        private sealed class TimedJsonContent : HttpContent
+        {
+            private readonly JsonObject   _payload;
+            private readonly long         _length;
             private readonly IAgentLogger? _logger;
 
-            public TimedStringContent(string content, Encoding encoding, string mediaType, IAgentLogger? logger)
-                : base(content, encoding, mediaType)
+            public TimedJsonContent(JsonObject payload, long length, IAgentLogger? logger)
             {
-                _logger = logger;
+                _payload = payload;
+                _length  = length;
+                _logger  = logger;
+                Headers.ContentType = new MediaTypeHeaderValue("application/json") { CharSet = "utf-8" };
+            }
+
+            protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
+                SerializeToStreamAsync(stream, context, CancellationToken.None);
+
+            protected override bool TryComputeLength(out long length)
+            {
+                length = _length;
+                return true;
             }
 
             protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken cancellationToken)
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                long bytes = Headers.ContentLength ?? -1;
-                _logger?.LogInfo($"[UploadTiming] Writing request body ({bytes / 1024.0:F1} KB) to the wire...");
+                _logger?.LogInfo($"[UploadTiming] Writing request body ({_length / 1024.0:F1} KB) to the wire...");
                 try
                 {
-                    await base.SerializeToStreamAsync(stream, context, cancellationToken);
-                    _logger?.LogInfo($"[UploadTiming] Body upload finished in {sw.Elapsed.TotalMilliseconds:F0}ms ({bytes / 1024.0:F1} KB).");
+                    var buf = new ArrayBufferWriter<byte>(64 * 1024);
+                    foreach (ReadOnlyMemory<byte> chunk in PayloadChunks(_payload, buf))
+                    {
+                        await stream.WriteAsync(chunk, cancellationToken);
+                        buf.Clear();
+                    }
+                    _logger?.LogInfo($"[UploadTiming] Body upload finished in {sw.Elapsed.TotalMilliseconds:F0}ms ({_length / 1024.0:F1} KB).");
                 }
                 catch (Exception ex)
                 {

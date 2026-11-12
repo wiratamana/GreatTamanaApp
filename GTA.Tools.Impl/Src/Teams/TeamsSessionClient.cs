@@ -1,4 +1,4 @@
-﻿
+
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
@@ -17,6 +17,24 @@ internal sealed class TeamsSessionState
     public string? TenantId { get; set; }
 }
 
+/// <summary>
+/// Level 0 token cache (Credentials\teams_token_cache.json): the chat token and the service map from the bootstrap.
+/// This is a bearer credential for about 1 hour. The file is gitignored (the whole Credentials folder is).
+/// </summary>
+internal sealed class TeamsTokenCache
+{
+    public string Email { get; set; } = "";
+    public string ChatsvcToken { get; set; } = "";
+    public string ChatServiceBaseUrl { get; set; } = "";
+    public string MiddleTierBaseUrl { get; set; } = "";
+    public string Region { get; set; } = "";
+    public string Partition { get; set; } = "";
+    public string SkypeToken { get; set; } = "";
+    public string? ObjectId { get; set; }
+    public string? TenantId { get; set; }
+    public DateTime SavedAtUtc { get; set; }
+}
+
 /// <summary>Everything learned from the POST /api/authsvc/v1.0/authz bootstrap call.</summary>
 public sealed class TeamsRegionInfo
 {
@@ -28,7 +46,7 @@ public sealed class TeamsRegionInfo
     public string RawAuthzResponse { get; set; } = "";
 }
 
-public sealed class TeamsSessionClient : IDisposable
+public sealed partial class TeamsSessionClient : IDisposable
 {
     private const string ClientId = "5e3ce6c0-2b1f-4285-8d4b-75ee78787346"; // "Microsoft Teams Web Client" MSAL SPA client id
     private const string Scope = "https://api.spaces.skype.com/.default openid profile offline_access";
@@ -38,6 +56,7 @@ public sealed class TeamsSessionClient : IDisposable
     private readonly string _email;
     private readonly string _password;
     private readonly string _sessionFilePath;
+    private readonly string _tokenCacheFilePath;
     private readonly Action<string>? _log;
     private readonly IDiagnosticDumper? _dumper;
     private readonly HttpClientHandler _handler;
@@ -51,11 +70,13 @@ public sealed class TeamsSessionClient : IDisposable
     private TeamsRegionInfo? _region;
     private string? _chatsvcAccessToken;
 
-    public TeamsSessionClient(string email, string password, string? sessionFilePath = null, Action<string>? logger = null, IDiagnosticDumper? dumper = null)
+    public TeamsSessionClient(string email, string password, string? sessionFilePath = null, Action<string>? logger = null,
+        IDiagnosticDumper? dumper = null, string? tokenCacheFilePath = null)
     {
         _email = email;
         _password = password;
         _sessionFilePath = sessionFilePath ?? Path.Combine(CredentialManager.CredentialsFolder, "teams_session.json");
+        _tokenCacheFilePath = tokenCacheFilePath ?? Path.Combine(CredentialManager.CredentialsFolder, "teams_token_cache.json");
         _log = logger;
         _dumper = dumper;
 
@@ -74,7 +95,10 @@ public sealed class TeamsSessionClient : IDisposable
 
     private void Log(string msg) => _log?.Invoke(msg);
 
-    public bool IsLoggedIn => !string.IsNullOrEmpty(_accessToken) && GetJwtExpiryUtc(_accessToken) > DateTime.UtcNow && _region != null;
+    /// <summary>True while the chat token is still valid for more than 1 minute (that is the token every chat call needs).</summary>
+    public bool IsLoggedIn => _region != null
+        && !string.IsNullOrEmpty(_chatsvcAccessToken)
+        && GetJwtExpiryUtc(_chatsvcAccessToken) > DateTime.UtcNow.AddMinutes(1);
 
     /// <summary>The signed-in user's AAD object id ("oid" claim), once logged in.</summary>
     public string? ObjectId => _objectId;
@@ -89,8 +113,19 @@ public sealed class TeamsSessionClient : IDisposable
 
     #region Login / session management
 
-    public async Task LoginAsync(bool forceFreshLogin = false)
+    /// <summary>
+    /// Signs in, cheapest way first:
+    ///   L0  saved chat token (Credentials\teams_token_cache.json)  -> no login, no bootstrap, no network call at all
+    ///   L1  saved AAD session / refresh_token (teams_session.json) -> no password, no ADFS; then the Teams bootstrap
+    ///   L2  full ADFS login with the password                     -> only when L0 and L1 both fail
+    /// <paramref name="forceFreshLogin"/> = skip L0 and L1 (real ADFS login). <paramref name="skipTokenCache"/> = skip L0 only
+    /// (used to renew a token the server just rejected, without touching the password).
+    /// </summary>
+    public async Task LoginAsync(bool forceFreshLogin = false, bool skipTokenCache = false)
     {
+        if (!forceFreshLogin && !skipTokenCache && TryUseTokenCache())
+            return;
+
         if (!forceFreshLogin && TryLoadSessionFromDisk(out var session))
         {
             var expiry = GetJwtExpiryUtc(session!.AccessToken);
@@ -300,7 +335,98 @@ public sealed class TeamsSessionClient : IDisposable
                 _chatsvcAccessToken = _accessToken;
             }
         }
+
+        // Level 0 cache: the next client can skip login + bootstrap completely.
+        SaveTokenCache();
     }
+
+    #region Token cache (level 0): skip login AND bootstrap
+
+    /// <summary>
+    /// Saves the chat token + service map, so the NEXT client (next tool call, or next program start) can use them
+    /// without any login and without the bootstrap calls. Written to a temp file first, then moved, so a second
+    /// process never reads a half-written file.
+    /// </summary>
+    private void SaveTokenCache()
+    {
+        try
+        {
+            if (_region == null || string.IsNullOrEmpty(_chatsvcAccessToken)) return;
+            // The fallback (chat token = AAD token) is rejected by the chat service. Never cache that.
+            if (string.Equals(_chatsvcAccessToken, _accessToken, StringComparison.Ordinal)) return;
+
+            var cache = new TeamsTokenCache
+            {
+                Email = _email,
+                ChatsvcToken = _chatsvcAccessToken!,
+                ChatServiceBaseUrl = _region.ChatServiceBaseUrl,
+                MiddleTierBaseUrl = _region.MiddleTierBaseUrl,
+                Region = _region.Region,
+                Partition = _region.Partition,
+                SkypeToken = _region.SkypeToken,
+                ObjectId = _objectId,
+                TenantId = _tenantId,
+                SavedAtUtc = DateTime.UtcNow,
+            };
+            string? dir = Path.GetDirectoryName(_tokenCacheFilePath);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            string tmp = _tokenCacheFilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            File.WriteAllText(tmp, JsonSerializer.Serialize(cache));
+            File.Move(tmp, _tokenCacheFilePath, overwrite: true);
+            Log($"Teams token cache saved (chat token valid until {GetJwtExpiryUtc(_chatsvcAccessToken!):u}): {_tokenCacheFilePath}");
+        }
+        catch (Exception ex)
+        {
+            Log($"Could not save the Teams token cache ({ex.Message}) -- continuing without it.");
+        }
+    }
+
+    /// <summary>
+    /// Level 0. Uses the saved chat token when it is still valid for more than 2 minutes: no ADFS login, no AAD call,
+    /// no bootstrap. The AAD refresh_token is still loaded from the session file, because the Graph tools need it.
+    /// Returns false (nothing changed) when the cache cannot be used.
+    /// </summary>
+    private bool TryUseTokenCache()
+    {
+        try
+        {
+            if (!File.Exists(_tokenCacheFilePath)) { Log("Token cache: no file yet."); return false; }
+            var cache = JsonSerializer.Deserialize<TeamsTokenCache>(File.ReadAllText(_tokenCacheFilePath));
+            if (cache == null || string.IsNullOrEmpty(cache.ChatsvcToken) || string.IsNullOrEmpty(cache.ChatServiceBaseUrl) || string.IsNullOrEmpty(cache.SkypeToken))
+            { Log("Token cache: file is incomplete, ignoring it."); return false; }
+            if (!string.Equals(cache.Email, _email, StringComparison.OrdinalIgnoreCase))
+            { Log("Token cache: it belongs to another account, ignoring it."); return false; }
+
+            DateTime expiry = GetJwtExpiryUtc(cache.ChatsvcToken);
+            if (expiry <= DateTime.UtcNow.AddMinutes(2))
+            { Log($"Token cache: chat token is expired or nearly expired ({expiry:u})."); return false; }
+
+            if (!TryLoadSessionFromDisk(out var session) || session == null || string.IsNullOrEmpty(session.RefreshToken))
+            { Log("Token cache: no refresh_token in the session file (Graph tools would fail), ignoring the cache."); return false; }
+
+            ApplyAadTokens(session.AccessToken, session.RefreshToken, session.IdToken,
+                session.ObjectId ?? cache.ObjectId, session.TenantId ?? cache.TenantId);
+            _region = new TeamsRegionInfo
+            {
+                Region = cache.Region,
+                Partition = cache.Partition,
+                SkypeToken = cache.SkypeToken,
+                ChatServiceBaseUrl = cache.ChatServiceBaseUrl,
+                MiddleTierBaseUrl = cache.MiddleTierBaseUrl,
+                RawAuthzResponse = "",
+            };
+            _chatsvcAccessToken = cache.ChatsvcToken;
+            Log($"Token cache HIT: reusing the saved chat token (valid until {expiry:u}). No login, no bootstrap.");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log($"Token cache: could not be read ({ex.Message}), ignoring it.");
+            return false;
+        }
+    }
+
+    #endregion
 
     private void EnsureAadLoggedIn()
     {
@@ -355,9 +481,11 @@ public sealed class TeamsSessionClient : IDisposable
         }
     }
 
+    /// <summary>Deletes both cache files (AAD session + chat token cache). The next login is a full ADFS login.</summary>
     public void ClearCachedSession()
     {
         try { if (File.Exists(_sessionFilePath)) File.Delete(_sessionFilePath); } catch { /* best effort */ }
+        try { if (File.Exists(_tokenCacheFilePath)) File.Delete(_tokenCacheFilePath); } catch { /* best effort */ }
     }
 
     private static DateTime GetJwtExpiryUtc(string jwt)

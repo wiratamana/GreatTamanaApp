@@ -110,8 +110,9 @@ public partial class LlmChatWindow : Window
 
     private Button? _injectButton;
 
-    // "⏸ Pause" / "▶ Resume" header button (see LlmChatWindow.Pause.cs)
-    private Button? _pauseButton;
+    // ⏸ Pause / ▶ Resume (see LlmChatWindow.Pause.cs and LlmChatWindow.PauseDump.cs)
+    private Button? _globalPauseButton;   // header, top right, left of 💉 Inject: pauses / resumes EVERYTHING
+    private Button? _pauseButton;         // input row, in the place of ⑂ Fork while the chat runs: this chat / Task only
 
 
     // ── Data ──────────────────────────────────────────────────────────────────
@@ -273,17 +274,37 @@ public partial class LlmChatWindow : Window
         };
         _roundTickTimer.Start();
 
+        // The big button is ⏹ STOP while the chat runs (also while it is paused) and ➤ Send otherwise.
+        // ⏸ / ▶ is the separate button in the place of ⑂ Fork (see LlmChatWindow.Pause.cs).
         _sendButton.Click += (_, _) =>
         {
-            if (_current != null && _current.IsPaused)
-                ResumeSession(_current);
-            else if (_current != null && _current.Runtime.TaskCurrentUnitIndex >= 0)
-                CancelRunningTask(_current);
+            var cur = _current;
+            if (cur != null && ResolvePauseOwner(cur) is { } owner && owner.Runtime.RestoredPause != null)
+                DiscardRestoredPause(owner);                 // paused in the file only: Stop = throw the saved pause away
+            else if (cur != null && cur.IsTask && cur.Runtime.TaskLoopActive)
+                CancelRunningTask(cur);
             else if (IsLlmRunning)
                 CancelCurrentLlm();
             else
                 SendCurrentMessage();
         };
+
+        // ⏸ / ▶ of this chat or Task, in the place of ⑂ Fork (visible while the chat runs)
+        _pauseButton = new Button
+        {
+            Content             = "⏸",
+            FontSize            = 18,
+            Width               = 44,
+            Height              = 44,
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            VerticalContentAlignment   = VerticalAlignment.Center,
+            Margin              = new Thickness(6, 0, 0, 0),
+            VerticalAlignment   = VerticalAlignment.Bottom,
+            IsVisible           = false,
+        };
+        UiTheme.StyleButton(_pauseButton, BgActiveItem, Brushes.White,
+            hoverBackground: BgHoverItem, pressedBackground: BgAiBubble);
+        _pauseButton.Click += (_, _) => OnSessionPauseClicked();
 
 
         _inputBox.AddHandler(
@@ -308,6 +329,7 @@ public partial class LlmChatWindow : Window
 
         Content = BuildRootLayout();
         LoadSavedSessions();
+        RestorePauseState();   // sessions/pause_state.json from a ⏸ Pause before the last close (see LlmChatWindow.PauseDump.cs)
     }
 
     // ── Public property ───────────────────────────────────────────────────────

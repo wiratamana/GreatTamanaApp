@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
+using GTA.Core;
 
 namespace GTA.Tools.Impl.Git
 {
@@ -119,11 +120,13 @@ namespace GTA.Tools.Impl.Git
                 var stdoutTask = process.StandardOutput.ReadToEndAsync();
                 var stderrTask = process.StandardError.ReadToEndAsync();
 
-                bool exited = process.WaitForExit(DEFAULT_TIMEOUT_MS);
+                // Kills the whole tree on timeout AND when the user presses STOP.
+                bool exited = ToolCancellation.WaitForExitOrKill(process, DEFAULT_TIMEOUT_MS, out bool cancelled);
+                if (cancelled)
+                    return $"⏹ STOPPED BY USER: 'git {SanitizeArgsForDisplay(args)}' was killed because the user pressed STOP. " +
+                           "It did NOT finish. Check the repository state (git status) before you repeat it.";
                 if (!exited)
                 {
-                    try { process.Kill(entireProcessTree: true); } catch { /* best effort */ }
-                    try { process.WaitForExit(3000); } catch { /* best effort */ }
                     return $"Error: 'git {SanitizeArgsForDisplay(args)}' timed out after {DEFAULT_TIMEOUT_MS / 1000} seconds and was killed.";
                 }
 

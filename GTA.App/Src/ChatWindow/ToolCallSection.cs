@@ -43,16 +43,42 @@ internal sealed class ToolCallSection
     private bool _expanded;
     private bool _userToggled;
 
+    // MEMORY: the body (PARAMS grid + OUTPUT, each with ScrollViewers / templated controls) is the heavy part of a
+    // tool card. A folded, finished card does not keep it: it is built from this factory when the user opens the
+    // card, and dropped again when the card is folded.
+    private Func<Control>? _bodyFactory;
+
+    // Replay of a file tool (write_file, edit_line ...): the cheap header stands in for the heavy FileToolCard,
+    // which is only built (and swapped in) when the user clicks the header.
+    private Func<(Control Real, Action Expand)>? _swapFactory;
+
     public Control Root { get; }
     public bool IsExpanded => _expanded;
 
     /// <summary>Name of the tool this section shows.</summary>
     public string ToolName { get; }
 
+    /// <summary>The parameters (JSON) given in SetParams — needed to rebuild a released body.</summary>
+    public string? InputJson { get; private set; }
+
     /// <summary>True when Finish() will fold the body by itself (live call the user did not touch).</summary>
     public bool WillAutoFold => _live && !_userToggled && _expanded;
 
-    public ToolCallSection(string toolName, Control bodyContent, Action<bool>? onToggle, bool live)
+    /// <summary>Replay card with a LAZY body: <paramref name="bodyFactory"/> runs on the first open (see class comment).</summary>
+    public ToolCallSection(string toolName, Func<Control> bodyFactory, Action<bool>? onToggle, bool live)
+        : this(toolName, (Control?)null, onToggle, live)
+    {
+        _bodyFactory = bodyFactory;
+    }
+
+    /// <summary>Replay card that is only a header; a click builds the real widget and swaps it in (see _swapFactory).</summary>
+    public ToolCallSection(string toolName, Func<(Control Real, Action Expand)> swapFactory)
+        : this(toolName, (Control?)null, null, live: false)
+    {
+        _swapFactory = swapFactory;
+    }
+
+    public ToolCallSection(string toolName, Control? bodyContent, Action<bool>? onToggle, bool live)
     {
         ToolName    = toolName;
         _isDispatch = toolName == "dispatch_sub_agent";
@@ -225,6 +251,7 @@ internal sealed class ToolCallSection
     /// <summary>The call's final parameters are known: show the one-line summary; a live call is now "running".</summary>
     public void SetParams(string? inputJson)
     {
+        InputJson = inputJson;
         _summary.Text = PickSummary(inputJson) ?? "";
         if (_live)
         {
@@ -303,6 +330,25 @@ internal sealed class ToolCallSection
 
     private void Toggle()
     {
+        // Replay of a file tool: build the real (heavy) card now and put it where this header is.
+        if (_swapFactory != null)
+        {
+            var make = _swapFactory;
+            _swapFactory = null;
+            if (Root.Parent is Panel host)
+            {
+                int at = host.Children.IndexOf(Root);
+                if (at >= 0)
+                {
+                    var (real, expand) = make();
+                    host.Children[at] = real;
+                    expand();
+                    return;
+                }
+            }
+            return;
+        }
+
         _userToggled = true;
 
         if (_expanded)
@@ -314,6 +360,7 @@ internal sealed class ToolCallSection
             CancelFold();   // may run a pending afterFold → result is stored before we expand
             _expanded     = true;
             _chevron.Text = "▾";
+            EnsureBody();              // lazy card: build the PARAMS / OUTPUT body now
             _onToggle?.Invoke(true);   // builds the (lazy) output first, so the open animation knows the real height
             _foldTimer = FoldAnimator.Open(_body);
         }
@@ -373,6 +420,30 @@ internal sealed class ToolCallSection
         _pendingAfterFold = null;
         pending?.Invoke();
         _onToggle?.Invoke(false);
+        ReleaseBody();
+    }
+
+    /// <summary>Let the factory-built body go (only for a finished card that can rebuild it on demand).</summary>
+    private void ReleaseBody()
+    {
+        if (_bodyFactory == null || _live || _expanded) return;
+        _body.Child = null;
+    }
+
+    private void EnsureBody()
+    {
+        if (_bodyFactory != null && _body.Child == null)
+            _body.Child = _bodyFactory();
+    }
+
+    /// <summary>
+    /// A live card has just finished: from now on its body can be rebuilt from <paramref name="factory"/>, so a
+    /// folded card keeps only its header. If the card is open right now, the body is released when it is folded.
+    /// </summary>
+    public void MakeLazy(Func<Control> factory)
+    {
+        _bodyFactory = factory;
+        ReleaseBody();
     }
 
     private static string FormatTime(double seconds)

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text.Json.Nodes;
@@ -67,10 +67,18 @@ public static class ImageEvidenceStore
         }
     }
 
-    public static string SaveAndRedact(string rawResult, string evidenceDir, string? toolName = null)
+    /// <summary>
+    /// Saves every base64 image in <paramref name="rawResult"/> to a file and returns the text with a small
+    /// "[[SAVED_IMAGE …]]" marker instead. Tools in <see cref="ImageUtils.AlwaysKeepImageTools"/> keep their image
+    /// for the MODEL (the agent loop sends the raw result), so they are only left alone when
+    /// <paramref name="forDisplay"/> is false. With <paramref name="forDisplay"/> = true (the chat window, the saved
+    /// display record and the journal) the image is ALWAYS replaced by the marker: the window shows it from the file.
+    /// Without this, every load_image screenshot was kept as a multi-MB string in memory and in session.json twice.
+    /// </summary>
+    public static string SaveAndRedact(string rawResult, string evidenceDir, string? toolName = null, bool forDisplay = false)
     {
         if (string.IsNullOrEmpty(rawResult)) return rawResult;
-        if (ImageUtils.ShouldAlwaysKeepImage(toolName)) return rawResult;
+        if (!forDisplay && ImageUtils.ShouldAlwaysKeepImage(toolName)) return rawResult;
 
         try
         {

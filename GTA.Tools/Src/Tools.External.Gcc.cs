@@ -63,9 +63,10 @@ namespace GTA.Tools
 
             string exeName = useGpp ? "g++" : "gcc";
 
+            // gcc is purely offline: useProxy:false (no relay started, no proxy variables).
             return ExternalProcessUtils.RunCommand(
                 exeName, arguments, workingDirectory, timeoutSeconds * 1000,
-                null, ToolRegistry.ReportProgress);
+                null, ToolRegistry.ReportProgress, useProxy: false);
         }
     }
 }

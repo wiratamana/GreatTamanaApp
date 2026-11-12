@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -72,8 +72,10 @@ public static partial class ConversationPersistence
 
         try
         {
-            string raw = File.ReadAllText(filePath, Encoding.UTF8);
-            var obj = JsonNode.Parse(raw)?.AsObject();
+            // Parse straight from the file stream: no second copy of the whole file as a (UTF-16) string.
+            JsonObject? obj;
+            using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 128 * 1024))
+                obj = JsonNode.Parse(fs)?.AsObject();
             if (obj == null)
             {
                 session.IsFullyLoaded = true;
@@ -98,6 +100,8 @@ public static partial class ConversationPersistence
             var histArr = obj["conversationHistory"]?.AsArray();
             if (histArr != null)
             {
+                // DeepClone on purpose: a node parsed from the stream is a thin view over the WHOLE file's bytes
+                // (JsonDocument). The clone copies only its own slice, so the big parsed document can be freed.
                 foreach (JsonNode? node in histArr)
                 {
                     if (node != null)
@@ -105,9 +109,10 @@ public static partial class ConversationPersistence
                 }
             }
 
-            session.IsPaused = obj["isPaused"]?.GetValue<bool>() ?? false;
-            session.Runtime.SetUserPaused(session.IsPaused);
+            // NOTE: "isPaused" is deliberately NOT read here. Whether a session is paused is decided at app start from the
+            // pause file (see LlmChatWindow.RestorePauseState); a flag in an old session.json must not override it.
             session.TurnInProgress = obj["turnInProgress"]?.GetValue<bool>() ?? false;
+            RestorePreloadedTools(session, obj);
 
             // Sync title from full file (may differ from stub if renamed)
             if (obj["title"]?.GetValue<string>() is string title
@@ -127,6 +132,20 @@ public static partial class ConversationPersistence
                 $"Failed to load session '{session.Id}': {ex.Message}");
             session.IsFullyLoaded = true; // prevent retry loop
         }
+    }
+
+    /// <summary>The tools the user preloaded (and the ones the AI loaded itself) stay with the chat after an app restart.</summary>
+    private static void RestorePreloadedTools(ChatSession session, JsonObject obj)
+    {
+        if (obj["preloadedToolNames"] is JsonArray arr)
+            foreach (JsonNode? node in arr)
+                if (node?.GetValue<string>() is string name && !string.IsNullOrWhiteSpace(name))
+                    session.Runtime.PreloadedToolNames.Add(name);
+
+        if (obj["aiLoadedToolNames"] is JsonArray aiArr)
+            foreach (JsonNode? node in aiArr)
+                if (node?.GetValue<string>() is string aiName && !string.IsNullOrWhiteSpace(aiName))
+                    session.Runtime.AiLoadedToolNames.Add(aiName);
     }
 
     private static ChatSession? DeserializeStub(JsonObject obj)
@@ -196,6 +215,7 @@ public static partial class ConversationPersistence
             };
 
             stubSession.Runtime.SetUserPaused(isPaused);
+            RestorePreloadedTools(stubSession, obj);
 
             return stubSession;
         }
@@ -411,6 +431,11 @@ public static partial class ConversationPersistence
                         Timestamp      = rdTs,
                         CostUsd        = rdObj["costUsd"]?.GetValue<double>(),
                         ElapsedSeconds = rdObj["elapsedSeconds"]?.GetValue<double>(),
+                        KeepAlivePings      = rdObj["keepAlivePings"]?.GetValue<int>()        ?? 0,
+                        KeepAliveFailures   = rdObj["keepAliveFailures"]?.GetValue<int>()     ?? 0,
+                        KeepAliveReadTokens = rdObj["keepAliveReadTokens"]?.GetValue<int>()   ?? 0,
+                        KeepAliveCostUsd    = rdObj["keepAliveCostUsd"]?.GetValue<double>()   ?? 0,
+                        KeepAliveLastError  = rdObj["keepAliveLastError"]?.GetValue<string>(),
                     };
 
                     var ruObj = rdObj["tokenUsage"]?.AsObject();
@@ -418,14 +443,37 @@ public static partial class ConversationPersistence
                     {
                         round.Usage = new TokenUsage
                         {
-                            InputTokens              = ruObj["inputTokens"]?.GetValue<int>()              ?? 0,
-                            OutputTokens             = ruObj["outputTokens"]?.GetValue<int>()             ?? 0,
-                            CacheCreationInputTokens = ruObj["cacheCreationInputTokens"]?.GetValue<int>() ?? 0,
-                            CacheReadInputTokens     = ruObj["cacheReadInputTokens"]?.GetValue<int>()     ?? 0,
+                            InputTokens                = ruObj["inputTokens"]?.GetValue<int>()                ?? 0,
+                            OutputTokens               = ruObj["outputTokens"]?.GetValue<int>()               ?? 0,
+                            CacheCreationInputTokens   = ruObj["cacheCreationInputTokens"]?.GetValue<int>()   ?? 0,
+                            CacheCreation1hInputTokens = ruObj["cacheCreation1hInputTokens"]?.GetValue<int>() ?? 0,
+                            CacheReadInputTokens       = ruObj["cacheReadInputTokens"]?.GetValue<int>()       ?? 0,
+                            CacheTtl1h                 = ruObj["cacheTtl1h"]?.GetValue<bool>()                ?? false,
                         };
                     }
 
                     msg.Rounds.Add(round);
+                }
+            }
+
+            var pauseArr = obj["pauseMarkers"]?.AsArray();
+            if (pauseArr != null)
+            {
+                foreach (JsonNode? pn in pauseArr)
+                {
+                    if (pn == null) continue;
+                    var po = pn.AsObject();
+
+                    var marker = new DisplayPauseMarker
+                    {
+                        SequenceIndex = po["sequenceIndex"]?.GetValue<int>() ?? 0,
+                        Outcome       = po["outcome"]?.GetValue<string>() ?? string.Empty,
+                    };
+                    if (DateTimeOffset.TryParse(po["pausedAt"]?.GetValue<string>(), out DateTimeOffset pa))
+                        marker.PausedAt = pa;
+                    if (DateTimeOffset.TryParse(po["resumedAt"]?.GetValue<string>(), out DateTimeOffset ra))
+                        marker.ResumedAt = ra;
+                    msg.PauseMarkers.Add(marker);
                 }
             }
 
@@ -434,10 +482,12 @@ public static partial class ConversationPersistence
             {
                 msg.Usage = new TokenUsage
                 {
-                    InputTokens              = tuObj["inputTokens"]?.GetValue<int>()              ?? 0,
-                    OutputTokens             = tuObj["outputTokens"]?.GetValue<int>()             ?? 0,
-                    CacheCreationInputTokens = tuObj["cacheCreationInputTokens"]?.GetValue<int>() ?? 0,
-                    CacheReadInputTokens     = tuObj["cacheReadInputTokens"]?.GetValue<int>()     ?? 0,
+                    InputTokens                = tuObj["inputTokens"]?.GetValue<int>()                ?? 0,
+                    OutputTokens               = tuObj["outputTokens"]?.GetValue<int>()               ?? 0,
+                    CacheCreationInputTokens   = tuObj["cacheCreationInputTokens"]?.GetValue<int>()   ?? 0,
+                    CacheCreation1hInputTokens = tuObj["cacheCreation1hInputTokens"]?.GetValue<int>() ?? 0,
+                    CacheReadInputTokens       = tuObj["cacheReadInputTokens"]?.GetValue<int>()       ?? 0,
+                    CacheTtl1h                 = tuObj["cacheTtl1h"]?.GetValue<bool>()                ?? false,
                 };
             }
 

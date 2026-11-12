@@ -25,6 +25,15 @@ public sealed class AvaloniaAgentLogger : IAgentLogger
     public void LogWarning(string message) => Post($"⚠  {message}");
     public void LogError  (string message) => Post($"✗  {message}");
 
+    /// <summary>A cache keep-alive ping finished: always write it to the session log, and show it in the chat (see AddCacheKeepAliveNote).</summary>
+    public void LogCacheKeepAlive(int pingNumber, bool ok, TokenUsage usage, string? error)
+    {
+        SessionFileLogger.Log("KEEPALIVE", ok
+            ? $"ping #{pingNumber} ok | read={usage.CacheReadInputTokens:N0} write={usage.CacheCreationInputTokens:N0} uncached-in={usage.InputTokens:N0} out={usage.OutputTokens:N0}"
+            : $"ping #{pingNumber} FAILED | {error}");
+        _window.AddCacheKeepAliveNote(_session, pingNumber, ok, usage, error);
+    }
+
     /// <summary>Creates a foldable "Round N" section in the chat window.</summary>
     public void LogRound(int round)
     {
@@ -52,8 +61,12 @@ public sealed class AvaloniaAgentLogger : IAgentLogger
     {
         _lastToolName = toolName;
 
-        // Called right BEFORE the tool executes: the live Edit/Remove card reads the
-        // lines that are about to be deleted, so it can show them in red.
+        // Called right BEFORE the tool executes.
+        // 1) Route this tool's live output to ITS OWN widget. All widgets of a response already exist here, so the
+        //    "current panel" would otherwise be the LAST widget of the batch. Posted in order with the progress lines.
+        _window.ActivateToolProgress(_session, toolId);
+
+        // 2) The live Edit/Remove card reads the lines that are about to be deleted, so it can show them in red.
         FileToolCard.SnapshotBeforeExecute(toolId);
     }
     /// <summary>
@@ -104,7 +117,7 @@ public sealed class AvaloniaAgentLogger : IAgentLogger
         try
         {
             string evidenceDir = ConversationPersistence.EvidenceDir(_session.Id);
-            redacted = ImageEvidenceStore.SaveAndRedact(fullResult, evidenceDir, toolName);
+            redacted = ImageEvidenceStore.SaveAndRedact(fullResult, evidenceDir, toolName, forDisplay: true);
         }
         catch (Exception ex)
         {
@@ -160,12 +173,12 @@ public sealed class AvaloniaAgentLogger : IAgentLogger
             SessionFileLogger.Log("TOKENS",
                 $"Session total — " +
                 $"In={usage.InputTokens:N0}  Out={usage.OutputTokens:N0}  " +
-                $"CacheWrite={usage.CacheCreationInputTokens:N0}  CacheRead={usage.CacheReadInputTokens:N0}");
+                $"CacheWrite={usage.CacheCreationInputTokens:N0} (1h={usage.CacheCreation1hInputTokens:N0})  CacheRead={usage.CacheReadInputTokens:N0}");
         else
             SessionFileLogger.LogVerbose("TOKENS",
                 $"Turn — " +
                 $"In={usage.InputTokens:N0}  Out={usage.OutputTokens:N0}  " +
-                $"CacheWrite={usage.CacheCreationInputTokens:N0}  CacheRead={usage.CacheReadInputTokens:N0}");
+                $"CacheWrite={usage.CacheCreationInputTokens:N0} (1h={usage.CacheCreation1hInputTokens:N0})  CacheRead={usage.CacheReadInputTokens:N0}");
         _window.AddTokenUsageBanner(_session, usage, isFinal);
     }
 
@@ -174,22 +187,39 @@ public sealed class AvaloniaAgentLogger : IAgentLogger
     /// <summary>This session's pause gate. A dispatched sub agent checks it before every round.</summary>
     public IPromptInjectionQueue? PauseGate => _session.Runtime;
 
-    /// <summary>Remembers the twin session (and its own task text) created by BeginSubAgentDispatch so EndSubAgentDispatch knows which one to finalize.</summary>
-    private (ChatSession Twin, string Task)? _subAgentDispatch;
+    /// <summary>
+    /// The twin session (and its own task text) of every sub agent that is running right now, keyed by the logger
+    /// BeginSubAgentDispatch returned for it. A dictionary (not one field), because sub agents run in PARALLEL.
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<IAgentLogger, (ChatSession Twin, string Task)> _subAgentDispatches = new();
+    /// <summary>The id of the session this logger writes to (a Sub Agent's logger: its twin). The pause file remembers it.</summary>
+    public string? SessionId => _session.Id;
 
-    public (IAgentLogger logger, IStreamRenderer renderer) BeginSubAgentDispatch(
-        string task, string modelName, IStreamRenderer mainRenderer)
+    /// <summary>
+    /// A Sub Agent that was paused (maybe before an app restart) continues: re-attach to its EXISTING twin session
+    /// instead of creating a new one. Falls back to a normal new dispatch when the twin is gone.
+    /// </summary>
+    public (IAgentLogger logger, IStreamRenderer renderer) ResumeSubAgentDispatch(
+        string twinSessionId, string task, string modelName, IStreamRenderer mainRenderer)
     {
         ChatSession? twin = null;
         using var doneSignal = new System.Threading.ManualResetEventSlim(false);
 
         void DoWork()
         {
-            _session.Runtime.BeginSubAgentRun(); // info only — does NOT touch any pause/hold
-            _window.RefreshInjectButtonLabel();
-
-            twin = _window.CreateSubAgentTwinSession(_session, task, modelName);
-            doneSignal.Set();
+            try
+            {
+                twin = _window.RestoreSubAgentTwinSession(twinSessionId, modelName);
+                if (twin != null)
+                {
+                    _session.Runtime.BeginSubAgentRun();
+                    _window.RefreshInjectButtonLabel();
+                }
+            }
+            finally
+            {
+                doneSignal.Set();
+            }
         }
 
         if (Dispatcher.UIThread.CheckAccess())
@@ -199,29 +229,73 @@ public sealed class AvaloniaAgentLogger : IAgentLogger
 
         doneSignal.Wait();
 
-        _subAgentDispatch = (twin!, task);
-        return (new AvaloniaAgentLogger(_window, twin!), new AvaloniaStreamRenderer(_window, twin!));
+        if (twin == null)
+            return BeginSubAgentDispatch(task, modelName, mainRenderer);   // twin is gone: start a fresh twin
+
+        var subLogger = new AvaloniaAgentLogger(_window, twin);
+        _subAgentDispatches[subLogger] = (twin, task);
+        return (subLogger, new AvaloniaStreamRenderer(_window, twin));
     }
 
-    public void EndSubAgentDispatch(bool success, string message)
-    {
-        var dispatch = _subAgentDispatch;
-        _subAgentDispatch = null;
-        if (dispatch == null) return;
 
-        var (twin, task) = dispatch.Value;
+    public (IAgentLogger logger, IStreamRenderer renderer) BeginSubAgentDispatch(
+        string task, string modelName, IStreamRenderer mainRenderer)
+    {
+        ChatSession? twin = null;
+        using var doneSignal = new System.Threading.ManualResetEventSlim(false);
+
+        void DoWork()
+        {
+            try
+            {
+                _session.Runtime.BeginSubAgentRun(); // info only — does NOT touch any pause/hold
+                _window.RefreshInjectButtonLabel();
+
+                twin = _window.CreateSubAgentTwinSession(_session, task, modelName);
+            }
+            finally
+            {
+                doneSignal.Set(); // never leave the caller waiting forever, also when the UI code throws
+            }
+        }
+
+        if (Dispatcher.UIThread.CheckAccess())
+            DoWork();
+        else
+            Dispatcher.UIThread.Post(DoWork);
+
+        doneSignal.Wait();
+
+        if (twin == null)
+            throw new InvalidOperationException("The Sub Agent's twin session could not be created.");
+
+        var subLogger = new AvaloniaAgentLogger(_window, twin);
+        _subAgentDispatches[subLogger] = (twin, task);
+        return (subLogger, new AvaloniaStreamRenderer(_window, twin));
+    }
+
+    public void EndSubAgentDispatch(IAgentLogger subLogger, bool success, string message)
+    {
+        if (!_subAgentDispatches.TryRemove(subLogger, out var dispatch)) return;
+
+        var (twin, task) = dispatch;
 
         using var doneSignal = new System.Threading.ManualResetEventSlim(false);
 
         void DoWork()
         {
-            _window.FinishSubAgentTwinSession(twin, success, message);
-            _window.AddSubAgentDispatchWidget(_session, twin.Id, task, success, message);
+            try
+            {
+                _window.FinishSubAgentTwinSession(twin, success, message);
+                _window.AddSubAgentDispatchWidget(_session, twin.Id, task, success, message);
 
-            _session.Runtime.EndSubAgentRun();   // BUG FIX: used to call Resume() and wipe the inject popup's pause
-            _window.RefreshInjectButtonLabel();
-
-            doneSignal.Set();
+                _session.Runtime.EndSubAgentRun();   // BUG FIX: used to call Resume() and wipe the inject popup's pause
+                _window.RefreshInjectButtonLabel();
+            }
+            finally
+            {
+                doneSignal.Set();
+            }
         }
 
         if (Dispatcher.UIThread.CheckAccess())

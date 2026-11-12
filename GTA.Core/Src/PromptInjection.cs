@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 
 namespace GTA.Core
@@ -35,11 +35,36 @@ namespace GTA.Core
         /// <summary>Atomically remove and return every injection queued so far (FIFO order), or an empty list if none are pending.</summary>
         List<PendingInjection> DrainPending();
 
-        /// <summary>True while the host UI wants <see cref="AgenticLoop"/> to hold BEFORE starting its NEXT round</summary>
+        /// <summary>
+        /// True while an OWNER (for example the 💉 Inject window) holds the NEXT round. Respected by the main loop AND by
+        /// every dispatched Sub Agent loop.
+        /// </summary>
         bool IsPaused => false;
+
+        /// <summary>
+        /// True while the USER asked for a pause (⏸ button, global or per session). Respected by the main loop at the very
+        /// end of a round (= before the next round starts) AND by every dispatched Sub Agent of that session (each one holds
+        /// before its next round). A Sub Agent can not be paused or resumed on its own: only through its parent.
+        /// </summary>
+        bool IsPauseRequested => false;
 
         void OnPauseWaitStart() { }
 
         void OnPauseWaitEnd() { }
+
+        /// <summary>
+        /// Called by the MAIN loop at the top of every round, before the pause check. <paramref name="nextRound"/> is the
+        /// number of the round that is about to start (a resume continues from it).
+        /// </summary>
+        void OnRoundFence(int nextRound) { }
+
+        /// <summary>
+        /// Called by the MAIN loop (never by a Sub Agent loop) with true when it starts to hold at the round fence and
+        /// with false when it leaves it. While it is true the history is complete and nothing changes it, so it can be saved.
+        /// </summary>
+        void OnMainFenceHold(bool holding) { }
+
+        /// <summary>The Sub Agent batch of this session's main loop (see <see cref="DispatchTracker"/>), or null if the host has none.</summary>
+        DispatchTracker? DispatchTracker => null;
     }
 }

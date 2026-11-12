@@ -21,7 +21,21 @@ internal static class DispatchSubAgentTool
         "agent CANNOT use a shell/arbitrary-command tool, CANNOT mutate (create/modify/delete/move) " +
         "any file or folder, and can NEVER call dispatch_sub_agent/delegate_task/ask_questions — see " +
         "'allow_use_shell'/'allow_file_mutation' below to loosen the first two; the last one can " +
-        "never be loosened.",
+        "never be loosened. " +
+        "PARALLEL EXECUTION: if you call dispatch_sub_agent SEVERAL times in the SAME response (several " +
+        "tool calls in one message), ALL of those Sub Agents run AT THE SAME TIME, and you get every " +
+        "report back together once ALL of them have finished (success or failure). The total time is " +
+        "about the time of the slowest one, not the sum. Use this for independent tasks (for example: " +
+        "investigate 3 different folders, check 3 unrelated questions). At most " +
+        "4 run at once; extra ones wait for a free slot and still run. Rules for parallel use: " +
+        "(1) every task must be fully independent — a Sub Agent can NOT see the result or the work of " +
+        "another Sub Agent of the same batch, and it cannot see the other tool calls of this response; " +
+        "(2) never give two parallel Sub Agents 'allow_file_mutation: true' on the same file or folder — " +
+        "they would overwrite each other; (3) one Sub Agent failing does not stop the others — each " +
+        "report has its own SUCCESS/FAILURE status, so read every one; (4) each Sub Agent copies the " +
+        "whole conversation, so N parallel Sub Agents cost about N times the tokens — only parallelize " +
+        "when it really saves time; (5) if task B needs the result of task A, do NOT put them in the " +
+        "same response — dispatch A first, read its report, then dispatch B.",
         Tags = "interactive")]
     [Parameter(index: 0, name: "task",
         type: "string",

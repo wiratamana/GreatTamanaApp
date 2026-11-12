@@ -121,6 +121,13 @@ namespace GTA.Core
             if (usage["input_tokens"]                is JsonNode inp) r.InputTokens              = inp.GetValue<int>();
             if (usage["cache_creation_input_tokens"] is JsonNode cre) r.CacheCreationInputTokens = cre.GetValue<int>();
             if (usage["cache_read_input_tokens"]     is JsonNode hit) r.CacheReadInputTokens     = hit.GetValue<int>();
+
+            // Optional 5m / 1h split of the cache-write tokens: usage.cache_creation.{ephemeral_5m,ephemeral_1h}_input_tokens
+            if (usage["cache_creation"] is JsonObject split)
+            {
+                r.CacheCreationBreakdownSeen = true;
+                if (split["ephemeral_1h_input_tokens"] is JsonNode t1h) r.CacheCreation1hInputTokens = t1h.GetValue<int>();
+            }
         }
 
         private static async Task HandleBlockStart(

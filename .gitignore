@@ -1,4 +1,4 @@
-# Build output
+﻿# Build output
 bin/
 obj/
 publish/
@@ -27,6 +27,7 @@ BugReports/
 encyclopedia_kb/
 Screenshots/
 NetworkLogs*/
+*.dmp
 
 # Misc
 *.bak

@@ -60,6 +60,7 @@ public partial class LlmChatWindow
                         Stretch             = Stretch.Uniform,
                         HorizontalAlignment = HorizontalAlignment.Right,
                     };
+                    ImageContextMenu.Attach(img, imgPath); // right-click: Copy image / Show in explorer
                     userPanel.Children.Add(img);
 
                     var host = new LazyAttachedImageHost(img, imgPath);
@@ -100,97 +101,11 @@ public partial class LlmChatWindow
             // ── Timeline fix: reconstruct the full turn widget from saved history ───
             var contentPanel = new StackPanel { Spacing = 6 };
 
-            if (message.TextSegments.Count > 0 || message.Rounds.Count > 0)
+            if (message.TextSegments.Count > 0 || message.Rounds.Count > 0 || message.PauseMarkers.Count > 0)
             {
-                // NEW SESSIONS: full timeline reconstruction via SequenceIndex
-                var events = new List<(int seq, string type, object data)>(
-                    message.ThinkingBlocks.Count + message.ToolCalls.Count + message.TextSegments.Count
-                    + message.PromptInjections.Count + message.SubAgentDispatches.Count
-                    + message.Rounds.Count);
-
-                foreach (var tb in message.ThinkingBlocks)
-                    events.Add((tb.SequenceIndex, "thinking", tb));
-                foreach (var tc in message.ToolCalls)
-                    events.Add((tc.SequenceIndex, "toolcall", tc));
-                foreach (var seg in message.TextSegments)
-                    events.Add((seg.SequenceIndex, "text", seg));
-                foreach (var pi in message.PromptInjections)
-                    events.Add((pi.SequenceIndex, "injection", pi));
-                foreach (var sad in message.SubAgentDispatches)
-                    events.Add((sad.SequenceIndex, "subagent", sad));
-                foreach (var rd in message.Rounds)
-                    events.Add((rd.SequenceIndex, "round", rd));
-
-                events.Sort((a, b) => a.seq.CompareTo(b.seq));
-
-                // Everything after a round marker goes into that round's row (number on the left).
-                // Before the first marker (or in sessions saved without rounds) items go straight into contentPanel.
-                StackPanel target = contentPanel;
-
-                foreach (var (_, type, data) in events)
-                {
-                    switch (type)
-                    {
-                        case "round":
-                        {
-                            var row = BuildRoundRow((DisplayRound)data);
-                            contentPanel.Children.Add(row.Root);
-                            target = row.Items;
-                            break;
-                        }
-
-                        case "thinking":
-                        {
-                            var tb = (DisplayThinkingBlock)data;
-                            var thinkingTb = new SelectableTextBlock
-                            {
-                                Text         = tb.Text,
-                                TextWrapping = TextWrapping.Wrap,
-                                Foreground   = ColMuted,
-                                FontSize     = 12,
-                                FontFamily   = new FontFamily("Consolas, Courier New, monospace"),
-                                LineHeight   = 18,
-                                Opacity      = 0.9,
-                            };
-                            target.Children.Add(BuildCollapsibleThinkingSection(thinkingTb));
-                            break;
-                        }
-
-                        case "toolcall":
-                            target.Children.Add(BuildStaticToolCallSection((DisplayToolCall)data));
-                            break;
-
-                        case "injection":
-                            target.Children.Add(BuildPromptInjectionWidget((DisplayPromptInjection)data));
-                            break;
-
-                        case "subagent":
-                            target.Children.Add(BuildSubAgentDispatchWidget((DisplaySubAgentDispatch)data));
-                            break;
-
-                        case "text":
-                        {
-                            var seg = (DisplayTextSegment)data;
-                            if (!string.IsNullOrEmpty(seg.Text))
-                            {
-                                if (target.Children.Count > 0)
-                                {
-                                    target.Children.Add(new Border
-                                    {
-                                        Height     = 1,
-                                        Background = ColDivider,
-                                        Opacity    = 0.35,
-                                        Margin     = new Thickness(0, 2, 0, 2),
-                                    });
-                                }
-                                var textPanel = new StackPanel { Spacing = 4 };
-                                target.Children.Add(textPanel);
-                                RebuildMarkdownPanel(textPanel, seg.Text);
-                            }
-                            break;
-                        }
-                    }
-                }
+                // NEW SESSIONS: full timeline reconstruction via SequenceIndex.
+                // MEMORY: only the newest rounds are built; older ones come on request (LlmChatWindow.RoundArchive.cs).
+                BuildTurnTimeline(message, contentPanel);
             }
             else
             {
@@ -251,11 +166,17 @@ public partial class LlmChatWindow
                 }
             }
 
-            if (message.Usage.HasValue)
+            // No "Session total" row while the turn is PAUSED: the turn is not finished. It shows the pause widget only,
+            // and the total comes at the real end of the turn (see PauseMarkers).
+            bool stillPaused = message.PauseMarkers.Exists(p => p.Outcome.Length == 0);
+            if (message.Usage.HasValue && !stillPaused)
             {
                 contentPanel.Children.Add(BuildTokenUsageRow(
                     message.Usage.Value, isFinal: true, message.CostUsd));
             }
+
+            // A resume continues in THIS bubble: remember its content panel (see AttachToPausedTurnBubble).
+            TurnContentPanels.AddOrUpdate(message, contentPanel);
 
             bubbleContent = contentPanel;
         }
@@ -397,6 +318,43 @@ public partial class LlmChatWindow
     private static readonly SolidColorBrush RoundPillFg        = new(Color.FromRgb(170, 180, 255));
     private static readonly SolidColorBrush RoundLineBrush     = new(Color.FromArgb(55,  130, 145, 255));
 
+    // Same pill in AMBER = the 1-hour prompt-cache TTL was used in that round.
+    private static readonly SolidColorBrush RoundPill1hBg        = new(Color.FromArgb(48,  230, 160, 40));
+    private static readonly SolidColorBrush RoundPill1hBgHot     = new(Color.FromArgb(120, 230, 160, 40));
+    private static readonly SolidColorBrush RoundPill1hBorder    = new(Color.FromArgb(170, 240, 180, 70));
+    private static readonly SolidColorBrush RoundPill1hBorderHot = new(Color.FromRgb(250, 200, 100));
+    private static readonly SolidColorBrush RoundPill1hFg        = new(Color.FromRgb(245, 195, 90));
+
+    // Same pill in GREEN = the cache keep-alive pinged during a long tool of that round (and it worked).
+    private static readonly SolidColorBrush KaPillBg        = new(Color.FromArgb(48,  70, 200, 120));
+    private static readonly SolidColorBrush KaPillBgHot     = new(Color.FromArgb(120, 70, 200, 120));
+    private static readonly SolidColorBrush KaPillBorder    = new(Color.FromArgb(170, 90, 210, 140));
+    private static readonly SolidColorBrush KaPillBorderHot = new(Color.FromRgb(130, 230, 170));
+
+    /// <summary>Lives in <c>pill.Tag</c>: lets the live stream recolour the pill after the round's usage arrives.</summary>
+    private sealed class RoundPillState
+    {
+        public bool    Ttl1h;
+        public bool    KeepAlive;
+        public Action? Refresh;
+    }
+
+    /// <summary>Colour the round pill amber when this round used the 1-hour cache TTL (call again when usage arrives).</summary>
+    internal static void ApplyRoundTtlMark(Control badge, DisplayRound round)
+    {
+        if (badge.Tag is not RoundPillState st) return;
+        st.Ttl1h = round.Usage?.CacheTtl1h == true;
+        st.Refresh?.Invoke();
+    }
+
+    /// <summary>Colour the round pill green when cache keep-alive pings worked during this round's tools.</summary>
+    internal static void ApplyRoundKeepAliveMark(Control badge, DisplayRound round)
+    {
+        if (badge.Tag is not RoundPillState st) return;
+        st.KeepAlive = round.KeepAlivePings > 0;
+        st.Refresh?.Invoke();
+    }
+
     private sealed class RoundRow
     {
         public Grid       Root  { get; init; } = null!;
@@ -457,16 +415,26 @@ public partial class LlmChatWindow
             Cursor              = new Cursor(StandardCursorType.Hand),
             Child               = numText,
         };
+        var pillState = new RoundPillState
+        {
+            Ttl1h     = round.Usage?.CacheTtl1h == true,
+            KeepAlive = round.KeepAlivePings > 0,
+        };
+        pill.Tag = pillState;
         ToolTip.SetTip(pill, BuildRoundTooltip(round));
 
         bool hovered = false;
         void Refresh()
         {
             bool hot = hovered || logBorder.IsVisible;
-            pill.Background      = hot ? RoundPillBgHot : RoundPillBg;
-            pill.BorderBrush     = hot ? RoundPillBorderHot : RoundPillBorder;
-            numText.Foreground   = hot ? Brushes.White : RoundPillFg;
+            bool ttl = pillState.Ttl1h;   // 1-hour cache TTL used in this round => amber pill
+            bool ka  = pillState.KeepAlive && !ttl;   // cache keep-alive pings worked in this round => green pill
+            pill.Background      = hot ? (ka ? KaPillBgHot     : ttl ? RoundPill1hBgHot     : RoundPillBgHot)     : (ka ? KaPillBg     : ttl ? RoundPill1hBg     : RoundPillBg);
+            pill.BorderBrush     = hot ? (ka ? KaPillBorderHot : ttl ? RoundPill1hBorderHot : RoundPillBorderHot) : (ka ? KaPillBorder : ttl ? RoundPill1hBorder : RoundPillBorder);
+            numText.Foreground   = hot ? Brushes.White : (ka ? KaOkFg : ttl ? RoundPill1hFg : RoundPillFg);
         }
+        pillState.Refresh = Refresh;
+        Refresh();
         pill.PointerEntered += (_, _) => { hovered = true;  Refresh(); };
         pill.PointerExited  += (_, _) => { hovered = false; Refresh(); };
         pill.PointerPressed += (_, _) =>
@@ -523,6 +491,8 @@ public partial class LlmChatWindow
         string head = $"Round {round.Round}";
         if (round.ElapsedSeconds.HasValue)
             head += $"  ·  {round.ElapsedSeconds.Value:F1}s";
+        if (round.Usage?.CacheTtl1h == true)
+            head += "  ·  cache TTL 1h";
         panel.Children.Add(new TextBlock
         {
             Text       = head,
@@ -550,6 +520,21 @@ public partial class LlmChatWindow
                 TextWrapping = TextWrapping.Wrap,
             });
         }
+        // Cache keep-alive (pings sent while this round's tools ran a long time).
+        string? keepAliveText = BuildKeepAliveText(round);
+        if (keepAliveText != null)
+        {
+            bool bad = round.KeepAlivePings == 0;
+            panel.Children.Add(new TextBlock
+            {
+                Text         = keepAliveText,
+                FontSize     = 11,
+                Foreground   = bad ? KaBadFg : round.KeepAliveFailures > 0 ? KaWarnFg : KaOkFg,
+                TextWrapping = TextWrapping.Wrap,
+                Margin       = new Thickness(0, 0, 0, 4),
+            });
+        }
+
 
         return new Border
         {
@@ -573,41 +558,68 @@ public partial class LlmChatWindow
 
     // ── Static tool-call section (reloaded sessions) ──────────────────────────
 
-    /// <summary>Build a collapsible tool-call widget pre-populated with saved parameter and result data.</summary>
-    private static Control BuildStaticToolCallSection(DisplayToolCall tc)
+    /// <summary>
+    /// The PARAMS + OUTPUT body of one tool call, built from its saved data. Used (lazily) by replayed cards and by
+    /// live cards that finished and were folded. Returns the body and the host that builds the OUTPUT on demand.
+    /// </summary>
+    private static (Control Body, LazyToolResultHost Lazy) BuildToolBodyParts(
+        string toolName, string? inputJson, string? result)
     {
-        // File-writing IO tools (write_file, edit_line, …) replay as the same
-        // fancy Write/Edit card used while streaming — see FileToolCard.cs.
-        if (FileToolCard.TryGetKind(tc.ToolName, out var fileCardKind))
-        {
-            var card = new FileToolCard(fileCardKind, live: false);
-            card.OnInputComplete(tc.InputJson ?? "{}");
-            if (string.IsNullOrEmpty(tc.Result)) card.MarkNoResult();
-            else                                 card.SetResult(tc.Result);
-            return card.Root;
-        }
-
-        // Parameters as clean "name  value" rows (display only — the saved JSON is untouched).
         var paramsHolder = new StackPanel { Spacing = 2 };
-        paramsHolder.Children.Add(ToolCallSection.BuildReadableParams(tc.InputJson, tc.ToolName));
+        paramsHolder.Children.Add(ToolCallSection.BuildReadableParams(inputJson, toolName));
 
         var resultPanel = new StackPanel { Spacing = 2 };
         var lazyResult  = new LazyToolResultHost(resultPanel);
-        lazyResult.SetResult(tc.Result, isExpanded: false);
+        lazyResult.SetResult(result ?? string.Empty, isExpanded: false);
 
-        var contentPanel = ToolCallSection.BuildBody(
-            paramsHolder, resultPanel, isDispatch: tc.ToolName == "dispatch_sub_agent");
+        var body = ToolCallSection.BuildBody(
+            paramsHolder, resultPanel, isDispatch: toolName == "dispatch_sub_agent");
+        return (body, lazyResult);
+    }
 
-        var section = new ToolCallSection(tc.ToolName, contentPanel,
+    /// <summary>
+    /// Build a collapsible tool-call widget for saved data. MEMORY: only the cheap header is built here. The heavy
+    /// part (parameter grid, output, or for write_file / edit_line … the whole file card) is built when the user
+    /// opens the card, and a plain tool card drops it again when folded.
+    /// </summary>
+    private static Control BuildStaticToolCallSection(DisplayToolCall tc)
+    {
+        TimeSpan? took = tc.CompletedAt > tc.StartedAt ? tc.CompletedAt - tc.StartedAt : null;
+
+        // File-writing IO tools (write_file, edit_line, …) replay as the same
+        // fancy Write/Edit card used while streaming — see FileToolCard.cs.
+        // Here only a header stands in for it; the click builds the real card.
+        if (FileToolCard.TryGetKind(tc.ToolName, out var fileCardKind))
+        {
+            var stub = new ToolCallSection(tc.ToolName, () =>
+            {
+                var card = new FileToolCard(fileCardKind, live: false);
+                card.OnInputComplete(tc.InputJson ?? "{}");
+                if (string.IsNullOrEmpty(tc.Result)) card.MarkNoResult();
+                else                                 card.SetResult(tc.Result);
+                return (card.Root, () => card.ExpandNow());
+            });
+            stub.SetParams(tc.InputJson);   // one-line summary in the header (the path)
+            stub.MarkStatic(tc.Result, took);
+            return stub.Root;
+        }
+
+        LazyToolResultHost? current = null;
+        var section = new ToolCallSection(tc.ToolName,
+            () =>
+            {
+                var (body, lazy) = BuildToolBodyParts(tc.ToolName, tc.InputJson, tc.Result);
+                current = lazy;
+                return body;
+            },
             expanded =>
             {
-                if (expanded) lazyResult.OnExpand();
-                else          lazyResult.OnCollapse();
+                if (expanded) current?.OnExpand();
+                else          current?.OnCollapse();
             },
             live: false);
 
         section.SetParams(tc.InputJson);   // one-line summary in the header
-        TimeSpan? took = tc.CompletedAt > tc.StartedAt ? tc.CompletedAt - tc.StartedAt : null;
         section.MarkStatic(tc.Result, took);   // ✓ / ✗ + saved duration
 
         return section.Root;

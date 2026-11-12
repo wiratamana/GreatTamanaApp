@@ -54,6 +54,23 @@ public class DisplayPromptInjection
     /// <summary>Monotonically-increasing position of this event within the current turn — assigned when LlmChatWindow.AddInjectionWidget records it.</summary>
     public int             SequenceIndex  { get; set; } = 0;
 }
+/// <summary>
+/// The widget "⏸ Currently paused" inside the turn's bubble (looks like the cache keep-alive note). It is written when the
+/// turn is saved at a pause. After ▶ Resume the SAME widget turns green ("Resumed") and the turn goes on in the same bubble.
+/// Saved with the chat, so it is also there after an app restart. It is never sent to the LLM.
+/// </summary>
+public class DisplayPauseMarker
+{
+    /// <summary>Position in the turn's timeline (same counter as thinking / tool calls / text).</summary>
+    public int            SequenceIndex { get; set; } = 0;
+
+    public DateTimeOffset PausedAt      { get; set; } = DateTimeOffset.Now;
+    public DateTimeOffset? ResumedAt    { get; set; } = null;
+
+    /// <summary>"" = still paused. "resumed" = continued. "stopped" = the paused work was stopped / thrown away.</summary>
+    public string         Outcome       { get; set; } = string.Empty;
+}
+
 
 public class DisplaySubAgentDispatch
 {
@@ -94,6 +111,23 @@ public class DisplayRound
 
     /// <summary>Seconds spent waiting on the model call of this round (null when unknown).</summary>
     public double?        ElapsedSeconds { get; set; } = null;
+
+    // ── Cache keep-alive (pings sent while this round's tools ran a long time; shown as a note + in the hover popup) ──
+
+    /// <summary>Number of keep-alive pings that worked in this round.</summary>
+    public int            KeepAlivePings        { get; set; } = 0;
+
+    /// <summary>Number of keep-alive pings that failed in this round.</summary>
+    public int            KeepAliveFailures     { get; set; } = 0;
+
+    /// <summary>Tokens the pings read from the prompt cache (a big number = the cache was really kept alive).</summary>
+    public int            KeepAliveReadTokens   { get; set; } = 0;
+
+    /// <summary>USD cost of all pings of this round (not included in <see cref="CostUsd"/>, but in the session total).</summary>
+    public double         KeepAliveCostUsd      { get; set; } = 0;
+
+    /// <summary>Reason of the last failed ping of this round (null when none failed).</summary>
+    public string?        KeepAliveLastError    { get; set; } = null;
 }
 
 /// <summary>Kind of a single unit inside a Task's ordered "prompt blueprint" — see TaskUnit / TaskUnits / LlmChatWindow.Task.cs / TaskBuilderWindow.</summary>
@@ -180,6 +214,9 @@ public class ChatMessage
 
     public List<DisplayPromptInjection> PromptInjections { get; set; } = new();
 
+
+    /// <summary>⏸ Pause widgets of this turn (see DisplayPauseMarker). A resumed turn continues in the SAME bubble.</summary>
+    public List<DisplayPauseMarker> PauseMarkers { get; set; } = new();
     public List<DisplaySubAgentDispatch> SubAgentDispatches { get; set; } = new();
 
     /// <summary>Front-end-only round markers (number + per-round tokens/cost) — see DisplayRound.</summary>

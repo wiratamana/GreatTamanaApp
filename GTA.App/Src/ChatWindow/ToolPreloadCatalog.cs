@@ -55,13 +55,29 @@ internal static class ToolPreloadCatalog
 
         new Category(
             "box",
-            "Box.com cloud storage: browse folders, search, download/read docx, xlsx, pptx files and embedded images.",
+            "Box.com cloud storage: browse folders, search, download/read docx, xlsx, pptx files and embedded images. " +
+            "Also box_upload_file / box_upload_folder (upload a local file or a whole folder; existing files are compared by SHA-1 and only changed ones get a new version) " +
+            "and box_delete_file / box_delete_folder (delete to the Box Trash; the exact name must be given): " +
+            "these four are NOT discoverable by the AI, only enabled here, by a human.",
             name => HasAnyTag(name, "box_api")),
 
         new Category(
             "jira",
-            "JIRA issue tracker: read tickets, read attachments (docx/xlsx/pptx/images/video), post comments.",
+            "JIRA issue tracker: search all tickets by keyword (jira_search: returns ticket numbers + titles), read tickets, read attachments (docx/xlsx/pptx/images/video), post comments.",
             name => HasAnyTag(name, "jira_api")),
+
+        new Category(
+            "teams",
+            "Microsoft Teams: list rooms + ids, read messages by date range, look up user names, read the Activity feed (teams_fetch_notifications: @mentions, replies, reactions), " +
+            "read colleagues' calendars (teams_fetch_calendar) and find common free meeting time (teams_find_free_time). " +
+            "Also teams_post_message (send a message / attach files) and teams_edit_message (change the text of one of your own messages): " +
+            "they are NOT discoverable by the AI, only enabled here, by a human.",
+            name => HasAnyTag(name, "teams_api")),
+
+        new Category(
+            "outlook",
+            "Outlook mail (read only): fetch Inbox mails, newest first, with filters for date range, sender, Cc, unread, attachments and search text.",
+            name => HasAnyTag(name, "outlook_api")),
 
         new Category(
             "xlsx",

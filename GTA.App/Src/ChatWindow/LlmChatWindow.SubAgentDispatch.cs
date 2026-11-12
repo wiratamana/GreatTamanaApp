@@ -1,4 +1,4 @@
-using System.Linq;
+﻿using System.Linq;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
@@ -58,6 +58,30 @@ public partial class LlmChatWindow
         twin.TurnInProgress = true;
         ConversationPersistence.AppendJournal(twin.Id, "SUB AGENT TASK", task);
         ConversationPersistence.SaveSession(twin);
+
+        return twin;
+    }
+
+    /// <summary>
+    /// A Sub Agent that was paused (see LlmChatWindow.PauseDump.cs) is continued after an app restart: its twin session
+    /// already exists (loaded from disk). Opens it again as "running". Returns null when the twin is gone.
+    /// </summary>
+    internal ChatSession? RestoreSubAgentTwinSession(string twinSessionId, string modelName)
+    {
+        var twin = _sessions.FirstOrDefault(s => s.Id == twinSessionId);
+        if (twin == null) return null;
+
+        twin.Runtime.CurrentTurnModelName = modelName;
+        EnsureSessionPanelBuilt(twin);   // loads its saved chat when it is not loaded yet
+
+        twin.TurnInProgress = true;
+        BeginSessionTurn(twin);
+
+        // Continue in the Sub Agent's SAME bubble (its pause widget turns green), like the main chat does.
+        bool sameBubble = AttachToPausedTurnBubble(twin);
+        ClosePauseMarker(twin, "resumed");
+        if (!sameBubble)
+            AddStatusLine(twin, "▶  Resumed after a pause — continuing.");
 
         return twin;
     }

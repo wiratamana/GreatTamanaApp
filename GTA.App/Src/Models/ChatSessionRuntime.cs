@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Text.Json.Nodes;
 using System.Threading;
 using Avalonia.Controls;
 using GTA.Core;
@@ -92,7 +93,18 @@ public sealed class ChatSessionRuntime : IPromptInjectionQueue
     public string?      CurrentTurnModelName    { get; set; } = null;
     public TokenUsage    CurrentTurnUsageTotal  { get; set; } = default;
 
+    /// <summary>Usage of a turn BEFORE it was resumed after an app restart (zero for every other turn).</summary>
+    public TokenUsage    TurnUsageBase          { get; set; } = default;
+
+    /// <summary>Tools the USER picked (Preload Tools). Sent on every turn of this chat. Saved to disk with the chat.</summary>
     public HashSet<string> PreloadedToolNames { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Tools the AI loaded by itself with load_tools during a turn. Before, they vanished on the next message,
+    /// while the AI still "remembered" loading them (history) and got confused. Now they stay for the whole chat.
+    /// Saved to disk with the chat. Not shown in the picker, so the user's own selection stays clean.
+    /// </summary>
+    public HashSet<string> AiLoadedToolNames { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     // ── Injection queue ───────────────────────────────────────────────────
     // A plain list (not a Queue) so the user can edit / remove one message while it waits.
@@ -103,7 +115,16 @@ public sealed class ChatSessionRuntime : IPromptInjectionQueue
     /// <summary>Raised (on ANY thread) whenever the queue changes: add, edit, remove, clear, or drained by the agent.</summary>
     public event Action? InjectionQueueChanged;
 
-    private void RaiseInjectionQueueChanged() => InjectionQueueChanged?.Invoke();
+    private int _injectionVersion = 0;
+
+    /// <summary>Counts every change of the queue (the pause file is rewritten when it changes while paused).</summary>
+    public int InjectionVersion => Volatile.Read(ref _injectionVersion);
+
+    private void RaiseInjectionQueueChanged()
+    {
+        Interlocked.Increment(ref _injectionVersion);
+        InjectionQueueChanged?.Invoke();
+    }
 
     public void EnqueueInjection(PendingInjection injection)
     {
@@ -198,25 +219,30 @@ public sealed class ChatSessionRuntime : IPromptInjectionQueue
     }
 
     // ── Pause ─────────────────────────────────────────────────────────────
-    // BUG FIX: there used to be ONE shared "_isPaused" bool, set by the inject popup AND by the
-    // sub-agent dispatch. When the sub agent finished it called Resume() and wiped the inject
-    // popup's pause, so the agent "whooshed" into the next round. Now every owner has its own
-    // hold. Releasing one never releases another.
+    // Two DIFFERENT things (never mix them up):
+    //   1. HOLDS (SetHold): an owner such as the 💉 Inject window keeps the NEXT round back. Every owner has its own
+    //      hold; releasing one never releases another (BUG FIX: one shared flag let a finishing sub agent wipe the
+    //      inject window's pause). Respected by the main loop AND by every sub agent.  -> IsPaused
+    //   2. The USER's ⏸ Pause (SetUserPaused): "stop at the end of the round, save everything, I may close the app".
+    //      Respected by the main loop AND by every sub agent of this session (they hold at their own fence).
+    //      -> IsPauseRequested. See LlmChatWindow.PauseDump.cs.
 
     private readonly object _holdLock = new();
     private readonly HashSet<object> _holds = new();
 
     private volatile bool _isUserPaused = false;
 
-    /// <summary>True when ANY owner (inject window, ...) or the user's own Pause holds this session.</summary>
+    /// <summary>True when ANY owner (inject window, ...) holds the next round. Does NOT include the user's ⏸ Pause.</summary>
     public bool IsPaused
     {
         get
         {
-            if (_isUserPaused) return true;
             lock (_holdLock) return _holds.Count > 0;
         }
     }
+
+    /// <summary>True while the user's ⏸ Pause is requested for this session (still running to the fence, or holding there).</summary>
+    public bool IsPauseRequested => _isUserPaused;
 
     /// <summary>Hold (on=true) or release (on=false) the NEXT round on behalf of owner. Only touches owner's own hold.</summary>
     public void SetHold(object owner, bool on)
@@ -235,6 +261,52 @@ public sealed class ChatSessionRuntime : IPromptInjectionQueue
 
     public void SetUserPaused(bool paused) => _isUserPaused = paused;
 
+    // ── Pause fence bookkeeping (written by the agent loop thread, read by the UI thread) ──
+
+    private int _nextRound = 1;
+
+    /// <summary>The round the main loop is about to start / is running. A resume continues from it.</summary>
+    public int NextRound => Volatile.Read(ref _nextRound);
+
+    public void OnRoundFence(int nextRound) => Volatile.Write(ref _nextRound, nextRound);
+
+    private volatile bool _atMainFence = false;
+
+    /// <summary>True while the MAIN loop of this session holds at the end of a round: history complete, nothing changes it.</summary>
+    public bool AtMainFence => _atMainFence;
+
+    public void OnMainFenceHold(bool holding) => _atMainFence = holding;
+
+    /// <summary>The Sub Agent batch of the main loop (see GTA.Core.DispatchTracker).</summary>
+    public DispatchTracker DispatchTracker { get; } = new();
+
+    /// <summary>Agent / backend of the turn that is running (needed to continue it after an app restart).</summary>
+    public string? CurrentTurnAgentName   { get; set; } = null;
+    public string? CurrentTurnBackendName { get; set; } = null;
+
+    /// <summary>The tool array of the running turn (load_tools adds to it) and the names that were in it at turn start.</summary>
+    public JsonArray?       PausableTurnTools     { get; set; } = null;
+    public HashSet<string>? PausableBaseToolNames { get; set; } = null;
+
+    /// <summary>True once this session's state was saved for the current pause (history + pause entry). Reset on resume.</summary>
+    public bool PauseDumped { get; set; } = false;
+
+    /// <summary>
+    /// Non-null when this session was loaded from the pause file after an app start: it is paused, but there is NO running
+    /// loop. "Resume" starts the work again from this entry; "Stop" throws it away.
+    /// </summary>
+    public PauseEntry? RestoredPause { get; set; } = null;
+
+    // Task loop (see LlmChatWindow.Task.cs / PauseDump.cs)
+    /// <summary>True from the start to the end of RunTaskAsync.</summary>
+    public bool TaskLoopActive { get; set; } = false;
+
+    /// <summary>Index of the step the task holds in front of (paused between steps), or -1.</summary>
+    public int TaskPausedAtIndex { get; set; } = -1;
+
+    /// <summary>Set by a Wait / Chain step that ended early because of a pause (the step is run again after the resume).</summary>
+    public bool TaskStepPausedEarly { get; set; } = false;
+
     private int _activeSubAgents = 0;
 
     /// <summary>How many dispatched sub agents are running for this session right now. Info only — it does NOT pause anything.</summary>
@@ -250,15 +322,23 @@ public sealed class ChatSessionRuntime : IPromptInjectionQueue
         while (Interlocked.CompareExchange(ref _activeSubAgents, cur - 1, cur) != cur);
     }
 
-    private volatile bool _isPauseActive = false;
+    // A COUNTER, not a bool: with parallel sub agents several loops can wait on the same gate at the same time.
+    // With a bool, the first one that resumed would clear the flag while the others still wait.
+    private int _pauseWaiters = 0;
 
-    public bool IsPauseActive => _isPauseActive;
+    public bool IsPauseActive => Volatile.Read(ref _pauseWaiters) > 0;
 
     /// <summary>OnPauseWaitStart.</summary>
-    public void OnPauseWaitStart() => _isPauseActive = true;
+    public void OnPauseWaitStart() => Interlocked.Increment(ref _pauseWaiters);
 
     /// <summary>OnPauseWaitEnd.</summary>
-    public void OnPauseWaitEnd() => _isPauseActive = false;
+    public void OnPauseWaitEnd()
+    {
+        // Never go below zero.
+        int cur;
+        do { cur = Volatile.Read(ref _pauseWaiters); if (cur <= 0) return; }
+        while (Interlocked.CompareExchange(ref _pauseWaiters, cur - 1, cur) != cur);
+    }
 
     public Action? TaskPauseButtonRefresh { get; set; } = null;
 
@@ -269,6 +349,14 @@ public sealed class ChatSessionRuntime : IPromptInjectionQueue
 
     /// <summary>Routing target: AddStatusLine sends sub-agent log lines into the active tool widget.</summary>
     public StackPanel? CurrentToolResultPanel { get; set; } = null;
+
+    /// <summary>
+    /// Tool id -> the panel that shows that tool's live output. All tool widgets of one model response are created
+    /// while the response streams in (BEFORE any tool runs), so "the most recently created widget" is NOT the tool that
+    /// is executing. The agent loop calls ActivateToolProgress(toolId) right before each tool executes, which looks the
+    /// panel up here. UI thread only.
+    /// </summary>
+    public Dictionary<string, StackPanel> ToolProgressPanels { get; } = new();
 
     /// <summary>Parameters sub-panel of the most-recently created tool widget.</summary>
     public StackPanel? CurrentToolParamsPanel { get; set; } = null;
@@ -286,9 +374,16 @@ public sealed class ChatSessionRuntime : IPromptInjectionQueue
     /// <summary>Front-end record of the current round (saved with the chat message).</summary>
     public DisplayRound? CurrentRoundRecord      { get; set; } = null;
 
+    /// <summary>The visible "cache kept warm" note of the current round (created by the first keep-alive ping, updated by the next ones).</summary>
+    public Avalonia.Controls.Border? CurrentKeepAliveNote { get; set; } = null;
+
+    /// <summary>Which old rounds of the RUNNING turn are not built as widgets (see LlmChatWindow.RoundArchive.cs). Null when none.</summary>
+    internal TurnArchive? CurrentTurnArchive { get; set; } = null;
+
     /// <summary>Reset per-turn scratch state at the start of a fresh assistant turn.</summary>
     public void ResetTurnScratchState()
     {
+        CurrentTurnArchive      = null;
         CurrentTurnSequence     = 0;
         CurrentTurnUsageTotal   = default;
         CurrentTurnContentPanel = null;
@@ -298,6 +393,7 @@ public sealed class ChatSessionRuntime : IPromptInjectionQueue
         CurrentRoundItemsPanel   = null;
         CurrentRoundBadge        = null;
         CurrentRoundRecord       = null;
+        CurrentKeepAliveNote     = null;
         CurrentRoundStopwatch    = null;
     }
 
@@ -311,17 +407,28 @@ public sealed class ChatSessionRuntime : IPromptInjectionQueue
         Cts?.Dispose();
         Cts                     = null;
         PendingToolResults.Clear();
+        ToolProgressPanels.Clear();
         PendingToolRecords.Clear();
+        CurrentTurnArchive      = null;
         CurrentTurnSequence     = 0;
 
         CurrentRoundContentPanel = null;
         CurrentRoundItemsPanel   = null;
         CurrentRoundBadge        = null;
         CurrentRoundRecord       = null;
+        CurrentKeepAliveNote     = null;
         CurrentRoundStopwatch    = null;
         CurrentCancelAttempt     = null;
         Interlocked.Exchange(ref _activeSubAgents, 0); // a cancelled turn never calls EndSubAgentRun
 
+
+        // Pause bookkeeping of the turn (the user's pause request itself is cleared by LlmChatWindow.ClearPauseState).
+        _atMainFence          = false;
+        PausableTurnTools     = null;
+        PausableBaseToolNames = null;
+        PauseDumped           = false;
+        TurnUsageBase         = default;
+        DispatchTracker.End();
         IsProcessing = false;
     }
 }

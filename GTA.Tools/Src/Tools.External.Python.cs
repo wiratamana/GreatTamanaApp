@@ -1,5 +1,6 @@
 #if !CO_WORKER_USE
 using System;
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
@@ -11,8 +12,7 @@ namespace GTA.Tools
 {
     internal static class ToolsExternalPython
     {
-        private const int DefaultTimeoutSeconds = 60;
-        private const int MaxTimeoutSeconds     = 900;
+        private const int DefaultTimeoutSeconds = 300;   // same default as run_shell; there is no maximum
 
         // true = send the code over stdin, false = temp .py file. See the header comment.
         private static readonly bool UseStdin = true;
@@ -29,7 +29,8 @@ namespace GTA.Tools
                 "loopback). For simple calls to the editor's HTTP server prefer http_request (it starts no " +
                 "process at all). Typical combination: http_request with save_to_file, then inline_python " +
                 "to parse that file. The code runs as 'python -u -' (code sent on stdin), with UTF-8 stdio. " +
-                "Print what you want to see — nothing is shown unless the code prints it. Only the Python " +
+                "Output is streamed live to the chat window while the code runs. The final result is " +
+                "everything printed (nothing is shown unless the code prints it). Only the Python " +
                 "standard library is guaranteed (numpy etc. may be missing). The same PowerShell hard wall " +
                 "as run_shell applies to the code text (no -EncodedCommand, -WindowStyle Hidden, " +
                 "-ExecutionPolicy Bypass, Invoke-RestMethod/Invoke-WebRequest/WebClient). A non-zero exit " +
@@ -42,7 +43,8 @@ namespace GTA.Tools
         [Parameter(index: 1, name: "timeout_seconds",
             type: "integer",
             description: "Optional. Max seconds to wait before force-killing python (and its child " +
-                         "processes). Default 60, maximum 900.",
+                         "processes). Defaults to 300 (5 minutes), same as run_shell. No maximum. Use a " +
+                         "larger value for long builds started from Python.",
             required: false)]
         [Parameter(index: 2, name: "working_directory",
             type: "string",
@@ -66,10 +68,10 @@ namespace GTA.Tools
                 if (blocked != null)
                     return blocked;
 
+                // Same as run_shell: default 5 minutes, NO upper cap.
                 int timeoutSeconds = GetInt(input, "timeout_seconds") ?? DefaultTimeoutSeconds;
                 if (timeoutSeconds <= 0)
                     return $"Error: 'timeout_seconds' must be a positive number — got {timeoutSeconds}.";
-                if (timeoutSeconds > MaxTimeoutSeconds) timeoutSeconds = MaxTimeoutSeconds;
 
                 string? rawWorkDir = GetString(input, "working_directory");
                 string workDir = string.IsNullOrWhiteSpace(rawWorkDir)
@@ -114,16 +116,32 @@ namespace GTA.Tools
 
                 psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
                 psi.EnvironmentVariables["PYTHONUTF8"]       = "1";
-                foreach (var kv in ToolsExternal.BuildProxyEnvironmentVariables())
-                    psi.EnvironmentVariables[kv.Key] = kv.Value;
+                // THE one global proxy method. Disposed (in the finally below) after python has ended.
+                using IDisposable proxyScope = GTA.Core.ProxyBridge.ApplyToStartInfo(psi);
 
                 try
                 {
                     using Process proc = Process.Start(psi)!;
 
-                    // Read both pipes while we write stdin, so a chatty script cannot deadlock.
-                    Task<string> outTask = proc.StandardOutput.ReadToEndAsync();
-                    Task<string> errTask = proc.StandardError.ReadToEndAsync();
+                    // Both pipes are read in the background (chunks, so a line without '\n' is not lost).
+                    // Everything is kept for the final result. The same chunks are queued for the LIVE view.
+                    // The queue is drained on THIS thread, because ToolRegistry.ReportProgress is tied to
+                    // the tool's own call-flow (same as run_shell / cmake / gcc).
+                    var stdoutSb  = new StringBuilder();
+                    var stderrSb  = new StringBuilder();
+                    var liveQueue = new ConcurrentQueue<(bool IsErr, string Text)>();
+                    Task outTask  = PumpPipe(proc.StandardOutput, stdoutSb, false, liveQueue);
+                    Task errTask  = PumpPipe(proc.StandardError,  stderrSb, true,  liveQueue);
+
+                    var liveOut = new LiveLineEmitter("");
+                    var liveErr = new LiveLineEmitter("[stderr] ");
+                    void Drain(bool final)
+                    {
+                        while (liveQueue.TryDequeue(out var item))
+                            (item.IsErr ? liveErr : liveOut).Add(item.Text);
+                        liveOut.Emit(final);
+                        liveErr.Emit(final);
+                    }
 
                     if (UseStdin)
                     {
@@ -135,21 +153,38 @@ namespace GTA.Tools
                         catch (IOException) { /* python exited before reading all the code */ }
                     }
 
-                    bool exited = proc.WaitForExit(timeoutSeconds * 1000);
+                    long timeoutMs = (long)timeoutSeconds * 1000;
+                    var waitClock = Stopwatch.StartNew();
+                    var stopToken = GTA.Core.ToolCancellation.Token;   // the user's STOP button
+                    bool exited;
+                    bool cancelled = false;
+                    while (true)
+                    {
+                        exited = proc.WaitForExit(250);
+                        Drain(false);
+                        if (exited || waitClock.ElapsedMilliseconds >= timeoutMs) break;
+                        if (stopToken.IsCancellationRequested) { cancelled = true; break; }
+                    }
+
                     string timeoutNote = "";
                     if (!exited)
                     {
-                        timeoutNote = $"\n\n⚠ TIMEOUT: python did not finish within {timeoutSeconds}s and was " +
-                                      "force-killed (with its child processes). Output below is what was printed " +
-                                      "before the kill. Pass a larger 'timeout_seconds' if the code is just slow.";
-                        try { proc.Kill(entireProcessTree: true); } catch { /* best effort */ }
-                        try { proc.WaitForExit(5000); } catch { /* best effort */ }
+                        timeoutNote = cancelled
+                            ? "\n\n⏹ STOPPED BY USER: python was killed (with its child processes) because the user pressed STOP. " +
+                              "The output above is only what was printed before the kill. The code did NOT finish."
+                            : $"\n\n⚠ TIMEOUT: python did not finish within {timeoutSeconds}s and was " +
+                              "force-killed (with its child processes). Output below is what was printed " +
+                              "before the kill. Pass a larger 'timeout_seconds' if the code is just slow.";
+                        GTA.Core.ToolCancellation.KillTree(proc);
                     }
 
                     // A grandchild process can keep a pipe open; do not wait for it forever.
                     try { Task.WaitAll(new Task[] { outTask, errTask }, 3000); } catch { /* handled below */ }
-                    string stdout = outTask.IsCompletedSuccessfully ? outTask.Result : "";
-                    string stderr = errTask.IsCompletedSuccessfully ? errTask.Result : "";
+                    Drain(true);
+
+                    string stdout, stderr;
+                    lock (stdoutSb) stdout = stdoutSb.ToString();
+                    lock (stderrSb) stderr = stderrSb.ToString();
                     string pipeNote = (outTask.IsCompleted && errTask.IsCompleted) ? "" :
                         "\n\n(note: a child process still holds the output pipe, so the output may be incomplete)";
 
@@ -183,6 +218,90 @@ namespace GTA.Tools
             catch (Exception ex)
             {
                 return $"Error: inline_python failed unexpectedly: {ex.GetType().FullName}: {ex.Message}";
+            }
+        }
+
+        /// <summary>Read a pipe to the end in the background. Every chunk goes to <paramref name="all"/> (final result) and to <paramref name="live"/> (live view).</summary>
+        private static Task PumpPipe(
+            StreamReader reader, StringBuilder all, bool isErr,
+            ConcurrentQueue<(bool IsErr, string Text)> live)
+        {
+            return Task.Run(async () =>
+            {
+                var buf = new char[4096];
+                try
+                {
+                    int n;
+                    while ((n = await reader.ReadAsync(buf, 0, buf.Length).ConfigureAwait(false)) > 0)
+                    {
+                        string s = new string(buf, 0, n);
+                        lock (all) all.Append(s);
+                        live.Enqueue((isErr, s));
+                    }
+                }
+                catch { /* pipe closed (process killed): the end of the output */ }
+            });
+        }
+
+        /// <summary>
+        /// Collects raw chunks and reports COMPLETE lines through ToolRegistry.ReportProgress (the live view
+        /// in the chat window). Same rules as the live tail of run_shell: a partial line waits for its newline
+        /// (unless it is very long or this is the final flush), and one message is capped to 8000 chars.
+        /// Only used from the tool's own thread.
+        /// </summary>
+        private sealed class LiveLineEmitter
+        {
+            private const int MaxMessageChars = 8000;
+            private readonly string _prefix;
+            private readonly StringBuilder _pending = new();
+
+            public LiveLineEmitter(string prefix) { _prefix = prefix; }
+
+            public void Add(string chunk) => _pending.Append(chunk);
+
+            public void Emit(bool final)
+            {
+                if (_pending.Length == 0) return;
+
+                string text = _pending.ToString().Replace("\r\n", "\n").Replace('\r', '\n');
+                int lastNl  = text.LastIndexOf('\n');
+
+                string complete;
+                if (lastNl >= 0)
+                {
+                    complete = text.Substring(0, lastNl);
+                    _pending.Clear();
+                    _pending.Append(text, lastNl + 1, text.Length - lastNl - 1);
+                }
+                else if (final || _pending.Length > 2000)
+                {
+                    complete = text;   // very long line, or the very end of the output
+                    _pending.Clear();
+                }
+                else
+                {
+                    return;            // wait for the rest of the line
+                }
+
+                if (final && _pending.Length > 0)
+                {
+                    complete += "\n" + _pending;
+                    _pending.Clear();
+                }
+                if (complete.Length == 0) return;
+
+                if (complete.Length > MaxMessageChars)
+                    complete = "…" + complete.Substring(complete.Length - MaxMessageChars);
+
+                if (_prefix.Length > 0)
+                {
+                    string[] parts = complete.Split('\n');
+                    for (int i = 0; i < parts.Length; i++) parts[i] = _prefix + parts[i];
+                    complete = string.Join("\n", parts);
+                }
+
+                try { ToolRegistry.ReportProgress(complete); }
+                catch { /* live display only — never break the tool */ }
             }
         }
 

@@ -40,7 +40,17 @@ public partial class LlmChatWindow
         var session = _current;
         if (session == null) return;
 
-        if (session.IsPaused) return;
+        if (session.IsPaused || ResolvePauseOwner(session).IsPaused)
+        {
+            AddStatusLine(session, "⏸  This chat is paused. Click ▶ Resume first (use the 💉 Inject window to queue a message for the next round).");
+            return;
+        }
+
+        if (_globalPauseRequested)
+        {
+            AddStatusLine(session, "⏸  Everything is paused (global ⏸ Pause). Click ▶ Resume at the top right first.");
+            return;
+        }
 
         if (session.Runtime.IsProcessing || session.Runtime.TaskCurrentUnitIndex >= 0) return;
 
@@ -184,11 +194,19 @@ public partial class LlmChatWindow
         List<string>?         attachedFiles     = null,
         AgentDefinition?      agentOverride     = null,
         IEnumerable<string>?  extraPreloadTools = null,
-        string?               backendOverride   = null)
+        string?               backendOverride   = null,
+        TurnResume?           resume            = null)
     {
         var runtime = session.Runtime;
         runtime.Cts = new CancellationTokenSource();
         var ct = runtime.Cts.Token;
+
+        // A global ⏸ Pause is on while this turn starts: it stops at the first round fence, before any model call.
+        if (_globalPauseRequested && !session.IsPaused)
+        {
+            session.IsPaused = true;
+            runtime.SetUserPaused(true);
+        }
 
         BeginSessionTurn(session);
 
@@ -206,10 +224,17 @@ public partial class LlmChatWindow
                 ? new GeminiTranslator()
                 : new ClaudeClient();
 
-        runtime.CurrentTurnModelName = llmClient.ModelName;
+        runtime.CurrentTurnModelName   = llmClient.ModelName;
+        runtime.CurrentTurnAgentName   = agent.Name;     // a resume after an app restart needs both
+        runtime.CurrentTurnBackendName = backendName;
+        runtime.OnRoundFence(resume?.NextRound ?? 1);
 
-        ConversationPersistence.AppendJournal(session.Id, "TURN START",
-            $"backend={backendName} model={llmClient.ModelName} agent={agent.Name} prompt chars={userText.Length}");
+        ConversationPersistence.AppendJournal(session.Id, resume == null ? "TURN START" : "TURN RESUME",
+            $"backend={backendName} model={llmClient.ModelName} agent={agent.Name} " +
+            (resume == null ? $"prompt chars={userText.Length}" : $"continues at round {resume.NextRound}"));
+
+        JsonArray?       turnTools     = null;   // the tool array of THIS turn (load_tools adds to it while the turn runs)
+        HashSet<string>? baseToolNames = null;   // names that were in it when the turn started
 
         try
         {
@@ -237,11 +262,19 @@ public partial class LlmChatWindow
             var tagSet = new HashSet<string>(agent.ToolTags, StringComparer.OrdinalIgnoreCase);
             var tools  = ToolRegistry.GetSchemaForTags(tagSet);
 
-            var preloadedToolNames = new List<string>(session.Runtime.PreloadedToolNames);
+            // Tools asked for by this run (task step, scheduled prompt, issue watcher) join the session's own set,
+            // so they stay for every later reply in the same chat. Before, they lasted for this one run only.
             if (extraPreloadTools != null)
-                preloadedToolNames.AddRange(extraPreloadTools);
+                foreach (string extra in extraPreloadTools)
+                    runtime.PreloadedToolNames.Add(extra);
 
-            if (preloadedToolNames.Count > 0)
+            // Order matters: the user's picks first, then what the AI loaded itself in earlier turns.
+            // Both stay for the whole chat. Only a new chat (or removing the pick in the picker) clears them.
+            var wantedToolNames = new List<string>(runtime.PreloadedToolNames);
+            foreach (string aiName in runtime.AiLoadedToolNames)
+                wantedToolNames.Add(aiName);
+
+            if (wantedToolNames.Count > 0)
             {
                 var alreadyPresent = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (JsonNode? t in tools)
@@ -250,7 +283,7 @@ public partial class LlmChatWindow
                     if (n != null) alreadyPresent.Add(n);
                 }
 
-                foreach (string name in preloadedToolNames)
+                foreach (string name in wantedToolNames)
                 {
                     if (alreadyPresent.Contains(name)) continue; // duplicate guard
 
@@ -266,6 +299,19 @@ public partial class LlmChatWindow
             if (settings.Search && isClaudeBackend)
                 foreach (JsonNode? t in AppConfig.WEB_TOOLS) tools.Add(t!.DeepClone());
 
+            // Remember what is in the array NOW. Anything added after this point came from load_tools.
+            turnTools      = tools;
+            baseToolNames  = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (JsonNode? t in tools)
+            {
+                string? n = t?["name"]?.GetValue<string>();
+                if (n != null) baseToolNames.Add(n);
+            }
+
+            // A pause saves what the AI loaded itself (load_tools) in this turn: the window needs both.
+            runtime.PausableTurnTools     = turnTools;
+            runtime.PausableBaseToolNames = baseToolNames;
+
             var logger   = new AvaloniaAgentLogger(this, session);
             var renderer = new AvaloniaStreamRenderer(this, session);
 
@@ -278,10 +324,18 @@ public partial class LlmChatWindow
 
             DelegateTaskContext.CurrentSession = session;
 
+            // RESUME (see LlmChatWindow.PauseDump.cs): the history already holds the prompt and everything done so far.
+            bool                 resumeTurn     = resume != null;
+            int                  startRound     = resume?.NextRound ?? 1;
+            DispatchResumeState? resumeDispatch = resume?.Dispatch;
+
             await Task.Run(async () =>
                 await AgenticLoop.RunAsync(
                         settings, tools, logger, renderer, sessionHistory, ct, llmClient,
-                        injectionQueue: runtime)
+                        injectionQueue: runtime,
+                        resumeTurn:     resumeTurn,
+                        startRound:     startRound,
+                        resumeDispatch: resumeDispatch)
                     .ConfigureAwait(false)
             ).ConfigureAwait(false);
         }
@@ -299,10 +353,44 @@ public partial class LlmChatWindow
         }
         finally
         {
+            // Keep what the AI loaded itself (load_tools) for every later message of this chat.
+            // Done BEFORE FinishSessionTurn, because that call saves the session to disk.
+            KeepAiLoadedTools(runtime, turnTools, baseToolNames);
+
             if (Dispatcher.UIThread.CheckAccess())
                 FinishSessionTurn(session);
             else
                 Dispatcher.UIThread.Post(() => FinishSessionTurn(session));
+        }
+    }
+
+    /// <summary>
+    /// Copies the tools the AI added with load_tools during this turn into the session, so the next turn starts
+    /// with them again. Anything that was already in the array at turn start is skipped (that is the agent's
+    /// default set, the user's picks, or the earlier AI-loaded tools).
+    /// </summary>
+    private static void KeepAiLoadedTools(ChatSessionRuntime runtime, JsonArray? turnTools, HashSet<string>? baseToolNames)
+    {
+        if (turnTools == null || baseToolNames == null) return;
+
+        try
+        {
+            var snapshot = new List<JsonNode?>(turnTools);   // copy first: the loop thread may still touch the array
+            foreach (JsonNode? t in snapshot)
+            {
+                string? name = t?["name"]?.GetValue<string>();
+                if (string.IsNullOrWhiteSpace(name)) continue;
+                if (baseToolNames.Contains(name)) continue;
+                if (ToolRegistry.IsHidden(name)) continue;                 // AI can not load these anyway
+                if (ToolRegistry.TryGetSchemaEntry(name) == null) continue; // not a registry tool (e.g. web tools)
+
+                runtime.AiLoadedToolNames.Add(name);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Never break the end of a turn because of this bookkeeping.
+            SessionFileLogger.LogException("KeepAiLoadedTools failed", ex);
         }
     }
 }

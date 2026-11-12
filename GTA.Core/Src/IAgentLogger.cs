@@ -42,11 +42,38 @@
 
         bool LastCallExceededContextLength { get => false; set { } }
 
-        /// <summary>Called right before AgenticLoop starts running a dispatched sub agent's own isolated nested loop.</summary>
+        /// <summary>
+        /// Called by the cache keep-alive after EACH ping it sent while a long tool runs, so the host can show it in the
+        /// GUI. <paramref name="ok"/> false = the ping failed (<paramref name="error"/> says why, may be null).
+        /// <paramref name="usage"/> is the usage of the ping (cache read / write / uncached input). Default: no-op.
+        /// </summary>
+        void LogCacheKeepAlive(int pingNumber, bool ok, TokenUsage usage, string? error) { }
+
+        /// <summary>
+        /// Called right before AgenticLoop starts running a dispatched sub agent's own isolated nested loop.
+        /// Several of these can be active AT THE SAME TIME (parallel sub agents), so an implementation must keep
+        /// its state per returned logger, not in one single field. Must be safe to call from any thread.
+        /// </summary>
         (IAgentLogger logger, IStreamRenderer renderer) BeginSubAgentDispatch(
             string task, string modelName, IStreamRenderer mainRenderer) => (this, mainRenderer);
 
-        void EndSubAgentDispatch(bool success, string message) { }
+        /// <summary>
+        /// Like <see cref="BeginSubAgentDispatch"/>, but for a Sub Agent that was paused and is now RESUMED: the host
+        /// should re-attach to the existing twin session <paramref name="twinSessionId"/> instead of creating a new one.
+        /// Default: starts a normal new dispatch.
+        /// </summary>
+        (IAgentLogger logger, IStreamRenderer renderer) ResumeSubAgentDispatch(
+            string twinSessionId, string task, string modelName, IStreamRenderer mainRenderer)
+            => BeginSubAgentDispatch(task, modelName, mainRenderer);
+
+        /// <summary>The id of the host session this logger writes to (null if the host has none). Used to remember a Sub Agent's twin.</summary>
+        string? SessionId => null;
+
+        /// <summary>
+        /// Closes ONE dispatch. <paramref name="subLogger"/> is the logger that BeginSubAgentDispatch returned for it.
+        /// Must be safe to call from any thread, also while other dispatches are still running.
+        /// </summary>
+        void EndSubAgentDispatch(IAgentLogger subLogger, bool success, string message) { }
 
         /// <summary>
         /// The host's pause gate for the session this logger writes to (or null if the host has none).

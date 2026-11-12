@@ -103,20 +103,15 @@ public partial class LlmChatWindow
     {
         if (!_sidebarRows.TryGetValue(session.Id, out var refs)) return;
 
-        if (session.IsPaused)
+        // Paused: the chat / Task itself, its step chat, or a Sub Agent below it (they are paused through their parent).
+        var pauseOwner = ResolvePauseOwner(session);
+        bool inPause   = session.IsPaused ||
+                         (session.ParentSessionId != null && pauseOwner.IsPaused &&
+                          (session.Runtime.IsProcessing || session.TurnInProgress));
+        if (inPause)
         {
-            bool active = session.Runtime.IsPauseActive;
-            if (!active && session.IsTask)
-            {
-                string? childId = session.Runtime.TaskCurrentChildSessionId;
-                if (childId != null)
-                {
-                    var child = _sessions.Find(s => s.Id == childId);
-                    if (child != null) active = child.Runtime.IsPauseActive;
-                }
-            }
-
-            ApplyBadge(refs.Badge, refs.BadgeText, active ? "⏸ PAUSED" : "⏳ PAUSING…", BadgeWarn);
+            bool settled = IsPauseSettled(pauseOwner);   // true = saved, safe to close. false = still finishing the round.
+            ApplyBadge(refs.Badge, refs.BadgeText, settled ? "⏸ PAUSED" : "⏳ PAUSING…", BadgeWarn);
             return;
         }
 

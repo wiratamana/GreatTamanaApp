@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 
@@ -27,13 +27,20 @@ namespace GTA.Core
         /// <summary>Cache-hit tokens (from message_start.message.usage.cache_read_input_tokens).</summary>
         public int CacheReadInputTokens      = 0;
 
+        /// <summary>1-hour part of the cache-write tokens (message_start usage.cache_creation.ephemeral_1h_input_tokens).</summary>
+        public int CacheCreation1hInputTokens = 0;
+
+        /// <summary>True when the API returned the usage.cache_creation 5m/1h breakdown object at all.</summary>
+        public bool CacheCreationBreakdownSeen = false;
+
         /// <summary>Snapshot of all accumulated token counts as a <see cref="TokenUsage"/> value.</summary>
         public TokenUsage Usage => new()
         {
-            InputTokens              = InputTokens,
-            OutputTokens             = OutputTokens,
-            CacheCreationInputTokens = CacheCreationInputTokens,
-            CacheReadInputTokens     = CacheReadInputTokens,
+            InputTokens                = InputTokens,
+            OutputTokens               = OutputTokens,
+            CacheCreationInputTokens   = CacheCreationInputTokens,
+            CacheCreation1hInputTokens = CacheCreation1hInputTokens,
+            CacheReadInputTokens       = CacheReadInputTokens,
         };
 
         // ── Stream-state flags ────────────────────────────────────────────────

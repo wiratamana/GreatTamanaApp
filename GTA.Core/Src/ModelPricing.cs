@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -10,7 +10,8 @@ namespace GTA.Core
         double InputPerMTok,
         double OutputPerMTok,
         double CacheWritePerMTok,
-        double CacheReadPerMTok);
+        double CacheReadPerMTok,
+        double CacheWrite1hPerMTok);
 
     public static class ModelPricing
     {
@@ -34,16 +35,23 @@ namespace GTA.Core
             return table.TryGetValue(modelName.Trim(), out entry);
         }
 
-        /// <summary>Compute the USD cost of one <see cref="TokenUsage"/> snapshot for <paramref name="modelName"/>.</summary>
+        /// <summary>
+        /// Compute the USD cost of one <see cref="TokenUsage"/> snapshot for <paramref name="modelName"/>.
+        /// Cache writes are split: the 5-minute part uses CacheWrite, the 1-hour part uses CacheWrite1h.
+        /// </summary>
         public static bool TryComputeCost(string? modelName, TokenUsage usage, out double costUsd)
         {
             costUsd = 0;
             if (!TryGetPrice(modelName, out ModelPriceEntry p)) return false;
 
+            int write1h = Math.Clamp(usage.CacheCreation1hInputTokens, 0, usage.CacheCreationInputTokens);
+            int write5m = usage.CacheCreationInputTokens - write1h;
+
             costUsd =
-                usage.InputTokens              / 1_000_000.0 * p.InputPerMTok      +
-                usage.OutputTokens             / 1_000_000.0 * p.OutputPerMTok     +
-                usage.CacheCreationInputTokens / 1_000_000.0 * p.CacheWritePerMTok  +
+                usage.InputTokens              / 1_000_000.0 * p.InputPerMTok       +
+                usage.OutputTokens             / 1_000_000.0 * p.OutputPerMTok      +
+                write5m                        / 1_000_000.0 * p.CacheWritePerMTok  +
+                write1h                        / 1_000_000.0 * p.CacheWrite1hPerMTok +
                 usage.CacheReadInputTokens     / 1_000_000.0 * p.CacheReadPerMTok;
             return true;
         }
@@ -90,12 +98,14 @@ namespace GTA.Core
             var result = new Dictionary<string, ModelPriceEntry>(StringComparer.OrdinalIgnoreCase);
 
             string? currentSection = null;
-            double input = 0, output = 0, cacheWrite = 0, cacheRead = 0;
+            double input = 0, output = 0, cacheWrite = 0, cacheWrite1h = 0, cacheRead = 0;
 
             void Flush()
             {
+                // CacheWrite1h missing (or 0) in the ini => fall back to CacheWrite, so old files keep working.
                 if (currentSection != null)
-                    result[currentSection] = new ModelPriceEntry(input, output, cacheWrite, cacheRead);
+                    result[currentSection] = new ModelPriceEntry(
+                        input, output, cacheWrite, cacheRead, cacheWrite1h > 0 ? cacheWrite1h : cacheWrite);
             }
 
             foreach (string rawLine in lines)
@@ -108,7 +118,7 @@ namespace GTA.Core
                 {
                     Flush();
                     currentSection = line[1..^1].Trim();
-                    input = output = cacheWrite = cacheRead = 0;
+                    input = output = cacheWrite = cacheWrite1h = cacheRead = 0;
                     continue;
                 }
 
@@ -126,10 +136,11 @@ namespace GTA.Core
 
                 switch (key.ToLowerInvariant())
                 {
-                    case "input":      input      = val; break;
-                    case "output":     output     = val; break;
-                    case "cachewrite": cacheWrite = val; break;
-                    case "cacheread":  cacheRead  = val; break;
+                    case "input":        input        = val; break;
+                    case "output":       output       = val; break;
+                    case "cachewrite":   cacheWrite   = val; break;
+                    case "cachewrite1h": cacheWrite1h = val; break;
+                    case "cacheread":    cacheRead    = val; break;
                 }
             }
 

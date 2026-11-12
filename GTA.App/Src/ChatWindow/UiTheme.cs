@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using Avalonia.Controls;
 using Avalonia.Media;
 
@@ -150,6 +150,7 @@ internal static class UiTheme
 
         res["TextControlPlaceholderForeground"]         = watermarkForeground ?? LlmChatWindow.ColMuted;
         res["TextControlPlaceholderForegroundPointerOver"] = watermarkForeground ?? LlmChatWindow.ColMuted;
+        res["TextControlPlaceholderForegroundFocused"]     = watermarkForeground ?? LlmChatWindow.ColMuted;
     }
 
     // ── Expander ──────────────────────────────────────────────────────────────

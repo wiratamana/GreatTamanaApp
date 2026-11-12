@@ -57,10 +57,14 @@ public partial class LlmChatWindow
         var row = BuildRoundRow(record);
         turnPanel.Children.Add(row.Root);
 
+        // MEMORY: a long run keeps only its newest rounds as widgets (the rest stays in the message / on disk).
+        TrimLiveRounds(session, turnPanel, row.Root);
+
         runtime.CurrentRoundContentPanel = row.Log;
         runtime.CurrentRoundItemsPanel   = row.Items;
         runtime.CurrentRoundBadge        = row.Badge;
         runtime.CurrentRoundRecord       = record;
+        runtime.CurrentKeepAliveNote     = null;
         runtime.CurrentRoundStopwatch    = new System.Diagnostics.Stopwatch();
 
         ScrollToBottom(session);
@@ -170,8 +174,16 @@ public partial class LlmChatWindow
 
     private void CancelCurrentLlm()
     {
-        try { _current?.Runtime.Cts?.Cancel(); }
+        var runtime = _current?.Runtime;
+        if (runtime == null) return;
+
+        try { runtime.Cts?.Cancel(); }
         catch { /* already cancelled or disposed — ignore */ }
+
+        // An open ask_questions window keeps its tool waiting for up to 30 minutes. Closing it releases the tool
+        // (it reports "closed without answering"), so STOP also works while the AI is waiting for an answer.
+        try { runtime.OpenAskQuestionsWindow?.Close(); }
+        catch { /* window already closed — ignore */ }
     }
 
     public FileToolCard? BeginToolCallWidget(ChatSession session, StackPanel turnPanel, string toolId, string toolName)
@@ -189,6 +201,7 @@ public partial class LlmChatWindow
 
             string cardKey = string.IsNullOrEmpty(toolId) ? $"__noid_{Guid.NewGuid()}" : toolId;
             FileToolCard.Register(cardKey, card);
+            runtime.ToolProgressPanels[cardKey] = card.ProgressSink;
             runtime.PendingToolResults[cardKey] = result =>
             {
                 card.SetResult(result);
@@ -246,10 +259,24 @@ public partial class LlmChatWindow
         runtime.CurrentToolResultPanel = resultPanel;
 
         string key = string.IsNullOrEmpty(toolId) ? $"__noid_{Guid.NewGuid()}" : toolId;
+        runtime.ToolProgressPanels[key] = resultPanel;
         runtime.PendingToolResults[key] = result =>
         {
             if (ReferenceEquals(runtime.CurrentToolResultPanel, resultPanel))
                 runtime.CurrentToolResultPanel = null;
+
+            // MEMORY: once the call is finished, its heavy body (params grid + output) is rebuilt from the saved
+            // data when the user opens the card, and dropped again when it is folded.
+            void MakeBodyLazy()
+            {
+                string? inputJson = section.InputJson;
+                section.MakeLazy(() =>
+                {
+                    var (body, lazy) = BuildToolBodyParts(toolName, inputJson, result);
+                    lazyResult = lazy;
+                    return body;
+                });
+            }
 
             if (section.WillAutoFold)
             {
@@ -257,16 +284,36 @@ public partial class LlmChatWindow
                 {
                     lazyResult.SetResult(result, false);
                     isExpandedNow = false;
+                    MakeBodyLazy();
                 });
             }
             else
             {
                 lazyResult.SetResult(result, isExpandedNow);
                 section.Finish(result, null);
+                MakeBodyLazy();
             }
         };
 
         return null;
+    }
+
+    /// <summary>
+    /// Called right BEFORE a tool executes: from now on its live output goes to THAT tool's widget. Needed because
+    /// every tool widget of a response is created while the response streams, so CurrentToolResultPanel would
+    /// otherwise point at the LAST widget of the batch (bug: live output of tool 1 showed up in the last tool).
+    /// </summary>
+    public void ActivateToolProgress(ChatSession session, string toolId)
+    {
+        if (!Dispatcher.UIThread.CheckAccess())
+        {
+            Dispatcher.UIThread.Post(() => ActivateToolProgress(session, toolId));
+            return;
+        }
+
+        if (string.IsNullOrEmpty(toolId)) return;
+        if (session.Runtime.ToolProgressPanels.TryGetValue(toolId, out StackPanel? panel))
+            session.Runtime.CurrentToolResultPanel = panel;
     }
 
     public void AppendToolProgressLine(ChatSession session, string text)
@@ -360,6 +407,7 @@ public partial class LlmChatWindow
         if (!string.IsNullOrEmpty(toolId) && pending.TryGetValue(toolId, out Action<string>? setter))
         {
             pending.Remove(toolId);
+            session.Runtime.ToolProgressPanels.Remove(toolId);
             setter(fullResult);
         }
 
@@ -378,6 +426,7 @@ public partial class LlmChatWindow
         if (!string.IsNullOrEmpty(toolId) && pending.TryGetValue(toolId, out Action<string>? setter))
         {
             pending.Remove(toolId);
+            session.Runtime.ToolProgressPanels.Remove(toolId);
             setter($"⚠ Interrupted — {reason}");
         }
 

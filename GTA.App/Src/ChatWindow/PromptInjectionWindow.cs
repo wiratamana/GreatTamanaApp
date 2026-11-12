@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -46,15 +46,12 @@ public sealed class PromptInjectionWindow : Window
     private readonly TextBox    _textBox;
     private readonly WrapPanel  _filesPanel;
     private readonly TextBlock  _toolsHeader;
-    private readonly StackPanel _categoriesPanel;
     private readonly Button     _saveBtn;
     private readonly Button     _cancelEditBtn;
     private readonly CheckBox   _holdCheck;
 
     private readonly List<string>    _attachedFiles = new();
     private readonly HashSet<string> _selectedTools = new(StringComparer.OrdinalIgnoreCase);
-    private readonly List<CheckBox>  _toolChecks    = new();
-    private bool _syncingTools;
 
     private string? _editingId;     // null = composing a NEW message
     private bool    _opened;
@@ -332,27 +329,19 @@ public sealed class PromptInjectionWindow : Window
             Foreground        = LlmChatWindow.ColText,
             VerticalAlignment = VerticalAlignment.Center,
         };
-        _categoriesPanel = new StackPanel { Spacing = 4 };
-        var toolsScroll = new ScrollViewer
+        // The tool list itself lives in the shared ToolPreloadPopupWindow (universal picker + "My presets").
+        var toolsBtn = new Button
         {
-            Content                       = _categoriesPanel,
-            MaxHeight                     = 220,
-            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
-            VerticalScrollBarVisibility   = ScrollBarVisibility.Auto,
+            Content                    = _toolsHeader,
+            HorizontalAlignment        = HorizontalAlignment.Stretch,
+            HorizontalContentAlignment = HorizontalAlignment.Left,
+            Padding                    = new Thickness(12, 9, 12, 9),
+            Margin                     = new Thickness(0, 8, 0, 0),
         };
-        var toolsExpander = new Expander
-        {
-            Header     = _toolsHeader,
-            Content    = toolsScroll,
-            IsExpanded = false,
-            Margin     = new Thickness(0, 8, 0, 0),
-            HorizontalAlignment = HorizontalAlignment.Stretch,
-        };
-        UiTheme.StyleExpander(toolsExpander,
-            headerBackground:  LlmChatWindow.BgAiBubble,
-            headerForeground:  LlmChatWindow.ColText,
-            contentBackground: LlmChatWindow.BgCodeBlock);
-        ToolTip.SetTip(toolsExpander, "Optionally load more tools for the AI. They are available starting from the round that receives this message.");
+        UiTheme.StyleButton(toolsBtn, LlmChatWindow.BgAiBubble, LlmChatWindow.ColText,
+            hoverBackground: LlmChatWindow.BgHoverItem, borderBrush: LlmChatWindow.ColDivider);
+        ToolTip.SetTip(toolsBtn, "Optionally load more tools for the AI. They are available starting from the round that receives this message.\nOpens the tool picker, where you can also use your saved presets.");
+        toolsBtn.Click += async (_, _) => await OpenToolPickerAsync();
 
         _saveBtn = new Button
         {
@@ -390,7 +379,7 @@ public sealed class PromptInjectionWindow : Window
         composerStack.Children.Add(_noteText);
         composerStack.Children.Add(_textBox);
         composerStack.Children.Add(_filesPanel);
-        composerStack.Children.Add(toolsExpander);
+        composerStack.Children.Add(toolsBtn);
         composerStack.Children.Add(actionRow);
 
         var composerCard = new Border
@@ -422,7 +411,6 @@ public sealed class PromptInjectionWindow : Window
         root.Children.Add(body);
         Content = root;
 
-        BuildToolTree();
         UpdateToolsHeader();
         UpdateComposerMode();
         RefreshQueue();
@@ -752,76 +740,14 @@ public sealed class PromptInjectionWindow : Window
 
     // ── Tools ─────────────────────────────────────────────────────────────
 
-    private void BuildToolTree()
+    // The tool list UI itself is the shared ToolPreloadPopupWindow (universal picker + "My presets").
+
+    /// <summary>Opens the shared tool picker on _selectedTools (the same HashSet, edited live).</summary>
+    private async Task OpenToolPickerAsync()
     {
-        foreach (ToolPreloadCatalog.Category cat in ToolPreloadCatalog.Categories)
-        {
-            List<string> toolNames = ToolPreloadCatalog.ToolsIn(cat);
-            if (toolNames.Count == 0) continue;
-            AddCategoryExpander(cat.Name, cat.Description, toolNames);
-        }
-
-        List<string> leftover = ToolPreloadCatalog.Uncategorized();
-        if (leftover.Count > 0)
-            AddCategoryExpander("other", "Tools that don't fall under any of the categories above.", leftover);
-    }
-
-    private void AddCategoryExpander(string categoryName, string categoryDescription, List<string> toolNames)
-    {
-        var innerStack = new StackPanel { Spacing = 2, Margin = new Thickness(20, 4, 4, 6) };
-
-        foreach (string name in toolNames)
-        {
-            var cb = new CheckBox
-            {
-                Content    = name,
-                Tag        = name,
-                FontSize   = 12,
-                Foreground = LlmChatWindow.ColText,
-                IsChecked  = false,
-            };
-            UiTheme.StyleCheckBox(cb, LlmChatWindow.ColText);
-
-            string? desc = ToolPreloadCatalog.DescriptionFor(name);
-            if (!string.IsNullOrEmpty(desc))
-                ToolTip.SetTip(cb, desc.Length > 320 ? desc[..320] + "…" : desc);
-
-            cb.IsCheckedChanged += (_, _) =>
-            {
-                if (_syncingTools) return;
-                if (cb.IsChecked == true) _selectedTools.Add(name);
-                else                      _selectedTools.Remove(name);
-                UpdateToolsHeader();
-            };
-
-            _toolChecks.Add(cb);
-            innerStack.Children.Add(cb);
-        }
-
-        var headerText = new TextBlock
-        {
-            Text              = categoryName,
-            FontSize          = 13,
-            FontWeight        = FontWeight.SemiBold,
-            Foreground        = LlmChatWindow.ColText,
-            VerticalAlignment = VerticalAlignment.Center,
-        };
-        ToolTip.SetTip(headerText, categoryDescription);
-
-        var expander = new Expander
-        {
-            Header     = headerText,
-            Content    = new Border { Background = LlmChatWindow.BgCodeBlock, Child = innerStack },
-            IsExpanded = false,
-            Margin     = new Thickness(0, 0, 0, 2),
-        };
-        UiTheme.StyleExpander(
-            expander,
-            headerBackground:  LlmChatWindow.BgAiBubble,
-            headerForeground:  LlmChatWindow.ColText,
-            contentBackground: LlmChatWindow.BgCodeBlock);
-
-        _categoriesPanel.Children.Add(expander);
+        var popup = new ToolPreloadPopupWindow(_selectedTools, UpdateToolsHeader, "Injection message");
+        await popup.ShowDialog(this);
+        UpdateToolsHeader();
     }
 
     /// <summary>Sets the tool selection to exactly names (also names that are not in the catalog any more).</summary>
@@ -829,23 +755,14 @@ public sealed class PromptInjectionWindow : Window
     {
         _selectedTools.Clear();
         foreach (string n in names) _selectedTools.Add(n);
-
-        _syncingTools = true;
-        try
-        {
-            foreach (CheckBox cb in _toolChecks)
-                cb.IsChecked = cb.Tag is string t && _selectedTools.Contains(t);
-        }
-        finally { _syncingTools = false; }
-
         UpdateToolsHeader();
     }
 
     private void UpdateToolsHeader()
     {
         _toolsHeader.Text = _selectedTools.Count == 0
-            ? "🧩  Load extra tools for the AI  (none)"
-            : $"🧩  Load extra tools for the AI  ({_selectedTools.Count} selected)";
+            ? "🧩  Load extra tools for the AI  (none)  —  click to choose or use a preset"
+            : $"🧩  Load extra tools for the AI  ({_selectedTools.Count} selected)  —  click to change";
     }
 
     // ── File attachment ───────────────────────────────────────────────────

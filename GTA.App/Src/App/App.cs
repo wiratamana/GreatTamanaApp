@@ -49,6 +49,9 @@ public class App : Application
 
             window.RefreshAgentSelector();
 
+            // Keeps the memory footprint small for the whole day (compacting GC, drops finished chats).
+            MemoryGovernor.Start();
+
 #if CO_WORKER_USE
             // Encrypted credentials were loaded in Program.Main. Credentials are optional; Settings opens by itself only for a damaged file.
             window.AppendLog("[Settings] " + SecureCredentialStore.StatusMessage, toFile: false);

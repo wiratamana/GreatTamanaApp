@@ -12,6 +12,31 @@ namespace GTA.Core
         public static string AZURE_BASE => InitSettings.Get("azure_anthropic_endpoint");
         public const string MODEL       = "claude-sonnet-5-5";
 
+        /// <summary>
+        /// Prompt-cache lifetime for the Claude (Azure) calls. Init key 'cache_ttl': "5m" (DEFAULT) or "1h".
+        /// "1h" makes EVERY cache write cost more (see CacheWrite1h in model_pricing.ini), so it is OFF by default.
+        /// Long tool runs (cmake, tests, long CLI) are covered by the cache keep-alive instead (see CACHE_KEEPALIVE).
+        /// If the API rejects 'ttl', AzureApiClient falls back to 5m.
+        /// </summary>
+        public static bool CACHE_TTL_1H =>
+            string.Equals(InitSettings.Get("cache_ttl", "5m").Trim(), "1h", StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Cache keep-alive. Init key 'cache_keepalive': "on" (DEFAULT) or "off".
+        /// While ONE tool runs for a long time, a tiny request (reads the cached prefix, writes nothing new) is sent
+        /// every CACHE_KEEPALIVE_INTERVAL_SECONDS. A cache READ refreshes the 5-minute timer, so the history does not
+        /// expire. Cost: one cache READ (0.1x input price) per ping, only when a tool runs longer than the interval.
+        /// Not used when cache_ttl = "1h" (the 1-hour entry already survives).
+        /// </summary>
+        public static bool CACHE_KEEPALIVE =>
+            !string.Equals(InitSettings.Get("cache_keepalive", "on").Trim(), "off", StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>Seconds between keep-alive pings. Init key 'cache_keepalive_interval_seconds' (default 240, allowed 30..280; the cache TTL is 300).</summary>
+        public static int CACHE_KEEPALIVE_INTERVAL_SECONDS =>
+            int.TryParse(InitSettings.Get("cache_keepalive_interval_seconds", "240").Trim(), out int s)
+                ? Math.Clamp(s, 30, 280)
+                : 240;
+
         // ── GPT (Azure OpenAI Responses API) ──
         public static string GPT_BASE => InitSettings.Get("azure_cognitive_endpoint");
         public const string GPT_MODEL          = "gpt-6.1-sol";
@@ -61,6 +86,14 @@ namespace GTA.Core
 
         /// <summary>Last-resort cap on tool-call rounds; intentionally effectively unlimited.</summary>
         public const int MAX_AGENTIC_ROUNDS = 999_999;
+
+        /// <summary>
+        /// How many dispatched Sub Agents of ONE model response may run at the same time. The others wait for a free
+        /// slot. Keeps API rate limits (HTTP 429) and token cost under control.
+        /// NOTE: the text of the dispatch_sub_agent tool description (DispatchSubAgentTool.cs) names this number.
+        /// A tool description must be a compile-time constant, so change it THERE too.
+        /// </summary>
+        public const int MAX_PARALLEL_SUB_AGENTS = 4;
 
         // ── Valid value sets ──
         public static readonly HashSet<string> VALID_THINKING =

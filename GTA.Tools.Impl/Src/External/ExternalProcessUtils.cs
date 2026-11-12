@@ -1,19 +1,23 @@
-#if !CO_WORKER_USE
+﻿#if !CO_WORKER_USE
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
+using GTA.Core;
 
 namespace GTA.Tools.Impl.External
 {
     /// <summary>Result of <see cref="ExternalProcessUtils.RunCmdCaptured"/>.</summary>
-    public sealed record CapturedCmdResult(bool Exited, int ExitCode, string Stdout, string Stderr);
+    public sealed record CapturedCmdResult(bool Exited, int ExitCode, string Stdout, string Stderr, bool Cancelled = false);
 
     /// <summary>
     /// The ONE place that runs a command through cmd.exe, captures stdout/stderr and streams it live.
     /// Used by run_shell, gcc and cmake so they all behave the same (live output, timeout kill, encoding).
+    /// It also applies the corporate-proxy setup (ProxyBridge.ApplyToStartInfo) in ONE place, so every caller
+    /// gets it automatically. Pass useProxy: false only for purely offline tools (gcc).
     /// </summary>
     public static class ExternalProcessUtils
     {
@@ -30,17 +34,22 @@ namespace GTA.Tools.Impl.External
             string? workingDirectory,
             int timeoutMs,
             IDictionary<string, string>? extraEnvironmentVariables = null,
-            Action<string>? onProgress = null)
+            Action<string>? onProgress = null,
+            bool useProxy = true)
         {
             string innerCmd = string.IsNullOrWhiteSpace(arguments) ? exeName : $"{exeName} {arguments}";
 
             try
             {
                 CapturedCmdResult r = RunCmdCaptured(
-                    innerCmd, exeName, workingDirectory, timeoutMs, extraEnvironmentVariables, onProgress);
+                    innerCmd, exeName, workingDirectory, timeoutMs, extraEnvironmentVariables, onProgress, useProxy);
 
                 string timeoutNote = "";
-                if (!r.Exited)
+                if (r.Cancelled)
+                {
+                    timeoutNote = StoppedByUserNote(exeName);
+                }
+                else if (!r.Exited)
                 {
                     timeoutNote =
                         $"\n\n⚠ TIMEOUT: '{exeName}' did not finish within {timeoutMs / 1000}s and was " +
@@ -74,7 +83,8 @@ namespace GTA.Tools.Impl.External
             string? workingDirectory,
             long timeoutMs,
             IDictionary<string, string>? extraEnvironmentVariables = null,
-            Action<string>? onProgress = null)
+            Action<string>? onProgress = null,
+            bool useProxy = true)
         {
             string fullCmd = $"/d /q /c chcp 65001>nul && {command}";
 
@@ -100,6 +110,12 @@ namespace GTA.Tools.Impl.External
                 psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
                 psi.EnvironmentVariables["PYTHONUTF8"]       = "1";
 
+                // THE one global proxy method (HTTP(S)_PROXY + tool adapters such as Scoop).
+                // Disposed when this method ends = after the command has finished.
+                using IDisposable? proxyScope = useProxy
+                    ? ProxyBridge.ApplyToStartInfo(psi, command)
+                    : null;
+
                 if (extraEnvironmentVariables != null)
                 {
                     foreach (var kv in extraEnvironmentVariables)
@@ -111,13 +127,16 @@ namespace GTA.Tools.Impl.External
                 var liveOut = new LiveFileTail(tempOut, "", onProgress);
                 var liveErr = new LiveFileTail(tempErr, "[stderr] ", onProgress);
                 var waitClock = Stopwatch.StartNew();
+                CancellationToken stopToken = ToolCancellation.Token;   // the user's STOP button
                 bool exited;
+                bool cancelled = false;
                 while (true)
                 {
                     exited = proc.WaitForExit(250);
                     liveOut.Pump();
                     liveErr.Pump();
                     if (exited || waitClock.ElapsedMilliseconds >= timeoutMs) break;
+                    if (stopToken.IsCancellationRequested) { cancelled = true; break; }
                 }
 
                 if (exited)
@@ -127,8 +146,10 @@ namespace GTA.Tools.Impl.External
                 }
                 else
                 {
-                    try { proc.Kill(entireProcessTree: true); } catch { /* best effort */ }
-                    try { proc.WaitForExit(5000); } catch { /* best effort */ }
+                    // Timeout OR the user pressed STOP: kill cmd.exe and everything it started.
+                    ToolCancellation.KillTree(proc);
+                    liveOut.Pump(final: true);   // show what was printed right before the kill
+                    liveErr.Pump(final: true);
                 }
 
                 int exitCode = 0;
@@ -137,7 +158,7 @@ namespace GTA.Tools.Impl.External
                     try { exitCode = proc.ExitCode; } catch { /* best effort */ }
                 }
 
-                return new CapturedCmdResult(exited, exitCode, ReadCapturedFile(tempOut), ReadCapturedFile(tempErr));
+                return new CapturedCmdResult(exited, exitCode, ReadCapturedFile(tempOut), ReadCapturedFile(tempErr), cancelled);
             }
             finally
             {
@@ -145,6 +166,12 @@ namespace GTA.Tools.Impl.External
                 TryDeleteFile(tempErr);
             }
         }
+
+        /// <summary>Note appended to the output of a command that was killed because the user pressed STOP.</summary>
+        public static string StoppedByUserNote(string what) =>
+            $"\n\n⏹ STOPPED BY USER: '{what}' was killed (with all its child processes) because the user pressed STOP. " +
+            "The output above is only what was printed before the kill. The command did NOT finish, " +
+            "so check the current state before you repeat or continue it.";
 
         /// <summary>Text appended to a result when the exit code is non-zero (empty output alone cannot show a killed/blocked command).</summary>
         public static string FormatExitNote(int exitCode)

@@ -67,6 +67,17 @@ namespace GTA.Tools
     {
     }
 
+    /// <summary>
+    /// Marks a DANGEROUS tool (it changes data on an outside system, e.g. posts a message) so the AI can never
+    /// find or load it by itself. Effects: (1) hidden from get_available_tools and load_tools;
+    /// (2) TryExecute refuses to run it unless a human put it in the conversation's tool array (Preload Tools).
+    /// Combine with [RecordToLog] so every call is traced.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Method, Inherited = false)]
+    public sealed class NotFindableByAiAttribute : Attribute
+    {
+    }
+
     public static class ToolRegistry
     {
         // ── Internal storage ──────────────────────────────────────────────────────
@@ -87,9 +98,12 @@ namespace GTA.Tools
         /// <summary>Set of tool names carrying <see cref="RecordToLogAttribute"/>.</summary>
         private static readonly HashSet<string> _recordToLogTools =
             new(StringComparer.OrdinalIgnoreCase);
-
         /// <summary>Tool names that must be registered and callable but hidden from the schema.</summary>
         private static readonly HashSet<string> _hiddenTools =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Set of tool names carrying <see cref="NotFindableByAiAttribute"/>.</summary>
+        private static readonly HashSet<string> _notFindableTools =
             new(StringComparer.OrdinalIgnoreCase);
 
         // ── Public surface ────────────────────────────────────────────────────────
@@ -129,6 +143,8 @@ namespace GTA.Tools
         /// <summary>Scans every type in the executing assembly for static methods decorated with [ToolInfo].</summary>
         public static void Initialize(Action<string>? log = null)
         {
+            _hiddenTools.ExceptWith(_notFindableTools);   // un-hide only what the attribute hid; RegisterExternal tools stay as they are
+            _notFindableTools.Clear();
             _tools.Clear();
             _paramTypes.Clear();
             _toolTags.Clear();
@@ -157,6 +173,9 @@ namespace GTA.Tools
 
                 // See RecordToLogAttribute's own doc comment — streamed to the session log.
                 bool recordToLog = method.GetCustomAttribute<RecordToLogAttribute>() != null;
+
+                // See NotFindableByAiAttribute's own doc comment — hidden from discovery, runs only if a human enabled it.
+                bool notFindable = method.GetCustomAttribute<NotFindableByAiAttribute>() != null;
 
                 List<ParameterAttribute> parms = method
                     .GetCustomAttributes<ParameterAttribute>()
@@ -203,9 +222,14 @@ namespace GTA.Tools
                     else                _fileMutatingTools.Remove(info.Name);
                     if (recordToLog)    _recordToLogTools.Add(info.Name);
                     else                _recordToLogTools.Remove(info.Name);
+                    if (notFindable)
+                    {
+                        _notFindableTools.Add(info.Name);
+                        _hiddenTools.Add(info.Name);   // hidden = also invisible to get_available_tools / load_tools
+                    }
 
                     string tagHint = tags.Length > 0 ? $" [{string.Join(", ", tags)}]" : "";
-                    string mutHint = (isFileMutating ? " [FILE-MUTATING]" : "") + (recordToLog ? " [RECORD-TO-LOG]" : "");
+                    string mutHint = (isFileMutating ? " [FILE-MUTATING]" : "") + (recordToLog ? " [RECORD-TO-LOG]" : "") + (notFindable ? " [NOT-FINDABLE-BY-AI]" : "");
                     log?.Invoke($"  [ToolRegistry] + {info.Name,-22} ({method.DeclaringType?.Name}.{method.Name}){tagHint}{mutHint}");
                 }
                 catch (Exception ex)
@@ -264,6 +288,15 @@ namespace GTA.Tools
         {
             if (!_tools.TryGetValue(name, out Func<JsonObject, object>? fn))
                 return (false, $"Error: Unknown tool '{name}'");
+
+            // A [NotFindableByAi] tool only runs when a human put it into this conversation's tool array
+            // (preload). Guessing its name is not enough: TryExecute does not otherwise check the active set.
+            if (_notFindableTools.Contains(name) && !IsInActiveTools(name))
+            {
+                SessionFileLogger.Log("TOOL_CALL", $"DENIED {name} (protected tool, not enabled in this conversation)");
+                return (true, $"Error: '{name}' is a protected tool and is not enabled in this conversation. " +
+                              "Only the user can enable it (Preload Tools). Do not try to work around this.");
+            }
 
             bool record = _recordToLogTools.Contains(name);
             var  sw     = Stopwatch.StartNew();
@@ -422,6 +455,9 @@ namespace GTA.Tools
         public static string[] GetTagsForTool(string name)
             => _toolTags.TryGetValue(name, out string[]? tags) ? tags : Array.Empty<string>();
 
+        /// <summary>True if a tool with this name is registered at all (loaded into the conversation or not). Case-insensitive.</summary>
+        public static bool IsKnownTool(string? name) => !string.IsNullOrEmpty(name) && _tools.ContainsKey(name);
+
         public static bool IsFileMutating(string name) => _fileMutatingTools.Contains(name);
 
         public static bool IsRecordToLog(string name) => _recordToLogTools.Contains(name);
@@ -475,7 +511,25 @@ namespace GTA.Tools
             Schema.Add(schemaEntry.DeepClone());
         }
 
-        /// <summary>True if the tool was registered via <see cref="RegisterExternal"/> with hidden: true.</summary>
+        /// <summary>True if the tool was registered via <see cref="RegisterExternal"/> with hidden: true (or carries <see cref="NotFindableByAiAttribute"/>).</summary>
         public static bool IsHidden(string name) => _hiddenTools.Contains(name);
+
+        /// <summary>True if the tool carries <see cref="NotFindableByAiAttribute"/> (only a human can enable it).</summary>
+        public static bool IsNotFindableByAi(string name) => _notFindableTools.Contains(name);
+
+        /// <summary>True if the tool's schema is in the tool array of the CURRENT conversation (<see cref="ActiveTools"/>).</summary>
+        private static bool IsInActiveTools(string name)
+        {
+            JsonArray? active = ActiveTools;
+            if (active == null) return false;
+
+            foreach (JsonNode? entry in active)
+            {
+                string? entryName = entry?["name"]?.GetValue<string>();
+                if (string.Equals(entryName, name, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
     }
 }

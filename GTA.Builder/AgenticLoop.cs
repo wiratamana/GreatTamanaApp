@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -13,6 +14,17 @@ namespace GTA.Builder
 {
     public static class AgenticLoop
     {
+        /// <summary>
+        /// Runs one user turn (many rounds). STOP-safe: whatever moment <paramref name="ct"/> is cancelled
+        /// (thinking, streaming, a tool running, waiting in a pause), the history is left VALID and the next
+        /// turn of the same chat can continue. See <see cref="ConversationHistoryRepair"/>.
+        ///
+        /// RESUME (after a pause that was saved to disk): <paramref name="resumeTurn"/> = true means the history already
+        /// holds the user prompt (and everything the turn did so far), so NO new user message is added.
+        /// <paramref name="startRound"/> is the round that was about to start. When the pause happened in the middle of a
+        /// Sub Agent dispatch, <paramref name="resumeDispatch"/> carries the tool results already produced in that round
+        /// and the state of every Sub Agent; the loop then continues that tool phase instead of calling the model.
+        /// </summary>
         public static async Task RunAsync(
             RunSettings          settings,
             JsonArray            tools,
@@ -21,19 +33,57 @@ namespace GTA.Builder
             JsonArray?           conversationHistory = null,
             CancellationToken    ct                  = default,
             ILlmClient?          llmClient           = null,
-            IPromptInjectionQueue? injectionQueue     = null)
+            IPromptInjectionQueue? injectionQueue     = null,
+            bool                 resumeTurn          = false,
+            int                  startRound          = 1,
+            DispatchResumeState? resumeDispatch      = null)
+        {
+            var messages = conversationHistory ?? new JsonArray();
+            try
+            {
+                await RunLoopAsync(settings, tools, logger, renderer, messages, ct, llmClient, injectionQueue,
+                        resumeTurn, startRound, resumeDispatch)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // The loop was cut at an arbitrary point. Close the history cleanly, THEN let the stop go up.
+                ConversationHistoryRepair.CloseInterruptedTurn(messages, logger);
+                throw;
+            }
+        }
+
+        private static async Task RunLoopAsync(
+            RunSettings          settings,
+            JsonArray            tools,
+            IAgentLogger         logger,
+            IStreamRenderer      renderer,
+            JsonArray            messages,
+            CancellationToken    ct,
+            ILlmClient?          llmClient,
+            IPromptInjectionQueue? injectionQueue,
+            bool                 resumeTurn,
+            int                  startRound,
+            DispatchResumeState? resumeDispatch)
         {
             ILlmClient client = llmClient ?? new ClaudeClient();
 
             string effectiveSystemPrompt = BuildEnrichedSystemPrompt(settings.SystemPrompt);
-
-            var messages = conversationHistory ?? new JsonArray();
-
-            if (settings.Files.Count == 0)
-                messages.Add(MessageBuilder.MakeUserMessage(settings.Prompt));
-            else
-                messages.Add(MessageBuilder.MakeUserMessageWithFiles(
-                    settings.Prompt, settings.Files, logger));
+            if (!resumeTurn)
+            {
+                if (settings.Files.Count == 0)
+                    messages.Add(MessageBuilder.MakeUserMessage(settings.Prompt));
+                else
+                    messages.Add(MessageBuilder.MakeUserMessageWithFiles(
+                        settings.Prompt, settings.Files, logger));
+            }
+            // The history of an earlier turn may be broken: the user pressed STOP in the middle of a tool call,
+            // the app was killed mid-turn, or the chat was saved by an older version. Heal it BEFORE the first
+            // API call. Without this, every call of the chat fails with HTTP 400.
+            // NOT when resuming inside a tool phase: then the last assistant message has tool calls that are
+            // answered a moment later, and the repair would wrongly fill them with "stopped" results.
+            if (resumeDispatch == null)
+                ConversationHistoryRepair.Repair(messages, logger);
 
             ToolRegistry.ActiveTools = tools;
             var sessionUsage = new TokenUsage();   // accumulated across all rounds
@@ -42,13 +92,39 @@ namespace GTA.Builder
 
             int contextLengthRollbackCount = 0;
             const int MaxContextLengthRollbacks = 5;
+            int ghostRetries = 0;   // consecutive responses that held ONLY non-existent tool calls
 
-            for (int round = 1; round <= AppConfig.MAX_AGENTIC_ROUNDS; round++)
+            bool resumingToolPhase = resumeDispatch != null;
+            DispatchResumeState? roundResumeState = null;
+
+            for (int round = Math.Max(1, startRound); round <= AppConfig.MAX_AGENTIC_ROUNDS; round++)
             {
                 ct.ThrowIfCancellationRequested();
 
+                JsonArray blocks;
+                string    stopReason;
+                long      callStartTs = Stopwatch.GetTimestamp();
+
+                if (resumingToolPhase)
+                {
+                    // RESUME in the middle of a round's tool phase (the pause came while Sub Agents were running).
+                    // The assistant message with the tool calls is already the last message of the history. Do not
+                    // call the model again: go straight to the tool phase and finish it.
+                    resumingToolPhase = false;
+                    roundResumeState  = resumeDispatch;
+                    stopReason = "tool_use";
+                    blocks     = (messages.Count > 0 ? (messages[^1] as JsonObject)?["content"] as JsonArray : null)
+                                 ?? new JsonArray();
+                    injectionQueue?.OnRoundFence(round);
+                    // No LogRound / info line here: the host keeps writing into the SAME round row and bubble, and shows
+                    // its own "▶ Resumed" widget. A second "round N" row would be a duplicate.
+                }
+                else
+                {
+                injectionQueue?.OnRoundFence(round);   // the host remembers it: a resume continues from this round
+
                 if (injectionQueue != null)
-                    await WaitWhilePausedAsync(logger, ct, injectionQueue);
+                    await WaitWhilePausedAsync(logger, ct, injectionQueue, injectionQueue.OnMainFenceHold, injectionQueue);
 
                 if (injectionQueue != null)
                 {
@@ -61,6 +137,10 @@ namespace GTA.Builder
 
                 int effectiveMaxTokens = settings.MaxTokens;
 
+                // Shrink every image that is too big for the API (it refuses the WHOLE request for one bad image).
+                GTA.Tools.Impl.Common.ImageHistoryGuard.ShrinkOversizedImages(messages, logger);
+
+                callStartTs = Stopwatch.GetTimestamp();   // this call (re)starts the 5-minute cache timer
                 JsonObject? resp = await client.CallAsync(
                     messages,
                     tools,
@@ -72,6 +152,10 @@ namespace GTA.Builder
                     logger,
                     renderer,
                     ct);
+
+                // STOP during the model call (thinking / streaming): do not treat it as "call failed" (null) and do not
+                // use a half or finished answer. Nothing of this round is in the history yet, so it stays valid.
+                ct.ThrowIfCancellationRequested();
 
                 if (resp == null)
                 {
@@ -106,14 +190,37 @@ namespace GTA.Builder
                 sessionUsage += roundUsage;
                 logger.LogTokenUsage(roundUsage);
 
-                string    stopReason = resp["stop_reason"]?.GetValue<string>() ?? "unknown";
-                JsonArray blocks     = resp["content"]?.AsArray() ?? new JsonArray();
+                stopReason = resp["stop_reason"]?.GetValue<string>() ?? "unknown";
+                blocks     = resp["content"]?.AsArray() ?? new JsonArray();
+
+                // GHOST TOOL CALLS: the model sometimes calls a tool that does not exist anywhere (not loaded AND
+                // not in the registry). Such a call is removed from the response BEFORE it enters the history, so
+                // the model never sees it (see StripGhostToolCalls for why this is safe for the API).
+                if (stopReason == "tool_use")
+                {
+                    if (ghostRetries < MaxGhostRetries)
+                    {
+                        List<string> dropped = StripGhostToolCalls(blocks, logger);
+                        if (dropped.Count > 0 && !ContainsToolUse(blocks))
+                        {
+                            // Nothing real is left to run. Throw the whole response away and ask again,
+                            // exactly as if the model had never produced it.
+                            ghostRetries++;
+                            logger.LogWarning(
+                                $"Model called non-existent tool(s): {string.Join(", ", dropped)}. " +
+                                $"Dropped from history, asking the model again ({ghostRetries}/{MaxGhostRetries}).");
+                            continue;
+                        }
+                    }
+                    ghostRetries = 0;   // real progress, or the retry budget is used up (then the explicit error below is sent)
+                }
 
                 messages.Add(new JsonObject
                 {
                     ["role"]    = "assistant",
                     ["content"] = blocks.DeepClone(),
                 });
+                }   // end of "normal round start" (model call). A resumed tool phase skips all of it.
 
                 if (stopReason != "tool_use")
                 {
@@ -125,8 +232,28 @@ namespace GTA.Builder
                 }
 
                 using IDisposable ledgerScope = FileViewLedger.BeginScope();
-                var toolResults = new JsonArray();
 
+                // On a resume inside the tool phase, the results already produced before the pause are used again.
+                DispatchResumeState? roundResume = roundResumeState;
+                roundResumeState = null;
+                var toolResults = roundResume != null ? roundResume.ToolResults : new JsonArray();
+
+                var answeredIds = new HashSet<string>(StringComparer.Ordinal);
+                foreach (JsonNode? r in toolResults)
+                    if (r?["tool_use_id"]?.GetValue<string>() is string aid) answeredIds.Add(aid);
+
+                // A long tool (cmake, tests, long CLI) must not let the 5-minute prompt cache expire.
+                // Normal short tools never cause a ping. Stopped + billed after the tool loop below.
+                using CacheKeepAlive keepAlive = CacheKeepAlive.Start(
+                    client, messages, tools, effectiveSystemPrompt,
+                    settings.Thinking, settings.Effort, logger, callStartTs);
+
+                // Parallel Sub Agents: reports of this response's dispatch calls (filled by the first dispatch call),
+                // and the dispatch calls whose write-ahead log was already written early.
+                var dispatchReports       = new Dictionary<string, (bool success, string message)>(StringComparer.Ordinal);
+                var preLoggedDispatchIds  = new HashSet<string>(StringComparer.Ordinal);
+                try
+                {
                 foreach (JsonNode? block in blocks)
                 {
                     ct.ThrowIfCancellationRequested();
@@ -136,36 +263,71 @@ namespace GTA.Builder
                     string id    = block["id"]!.GetValue<string>();
                     string name  = block["name"]!.GetValue<string>();
                     var    input = block["input"]!.AsObject();
+                    // Resume: this call already has its result (it ran before the pause). Do not run it again.
+                    if (answeredIds.Contains(id)) continue;
 
-                    string inputJson = input.ToJsonString();
-                    logger.LogToolCallFull(name, id, inputJson); // write-ahead: before anything runs
-                    logger.LogToolCall(name, id, inputJson[..Math.Min(200, inputJson.Length)]);
+                    // A dispatch call that was already logged (write-ahead) by an earlier dispatch call of the same batch.
+                    if (!preLoggedDispatchIds.Contains(id))
+                    {
+                        string inputJson = input.ToJsonString();
+                        logger.LogToolCallFull(name, id, inputJson); // write-ahead: before anything runs
+                        logger.LogToolCall(name, id, inputJson[..Math.Min(200, inputJson.Length)]);
+                    }
 
                     if (string.Equals(name, "dispatch_sub_agent", StringComparison.OrdinalIgnoreCase))
                     {
-                        string subTask = input["task"]?.GetValue<string>() ?? string.Empty;
+                        // PARALLEL SUB AGENTS: the FIRST dispatch call of this response starts ALL dispatch calls of
+                        // the response together and waits until every one of them has reported (or failed).
+                        // The later dispatch calls then just pick up their report from dispatchReports.
+                        if (!dispatchReports.TryGetValue(id, out (bool success, string message) report))
+                        {
+                            var batch = new List<(string id, JsonObject input)>();
+                            foreach (JsonNode? b in blocks)
+                            {
+                                if (!IsDispatchBlock(b)) continue;
 
-                        bool allowUseShell     = GetOptionalBoolInput(input, "allow_use_shell", false);
-                        bool allowFileMutation = GetOptionalBoolInput(input, "allow_file_mutation", false);
+                                string   bid    = b!["id"]!.GetValue<string>();
+                                string   bname  = b["name"]!.GetValue<string>();
+                                JsonObject bin  = b["input"]!.AsObject();
+                                batch.Add((bid, bin));
 
-                        (IAgentLogger subLogger, IStreamRenderer subRenderer) =
-                            logger.BeginSubAgentDispatch(subTask, client.ModelName, renderer);
+                                if (bid != id)
+                                {
+                                    // Write-ahead for the others now, because they start now (not when the loop reaches them).
+                                    preLoggedDispatchIds.Add(bid);
+                                    string bJson = bin.ToJsonString();
+                                    logger.LogToolCallFull(bname, bid, bJson);
+                                    logger.LogToolCall(bname, bid, bJson[..Math.Min(200, bJson.Length)]);
+                                }
+                            }
 
-                        logger.LogInfo(
-                            "🤖 Dispatched a Sub Agent to work on a task. This chat waits for its report. " +
-                            "A pause (⏸ Pause or the 💉 Inject window's hold) is respected: the Sub Agent " +
-                            "holds before its next round, and this chat holds before ITS next round.");
+                            logger.LogInfo(batch.Count == 1
+                                ? "🤖 Dispatched a Sub Agent to work on a task. This chat waits for its report. " +
+                                  "A pause (⏸ Pause) is respected: the Sub Agent holds before its next round, " +
+                                  "and this chat holds before ITS next round."
+                                : $"🤖 Dispatched {batch.Count} Sub Agents IN PARALLEL (max {AppConfig.MAX_PARALLEL_SUB_AGENTS} at the same time, " +
+                                  "the rest wait for a free slot). This chat waits until ALL of them have reported. " +
+                                  "A pause (⏸ Pause) is respected by every Sub Agent.");
 
-                        (bool subSuccess, string subMessage) = await RunDispatchedSubAgentAsync(
-                            messages, tools, subTask, client, settings, effectiveSystemPrompt,
-                            subLogger, subRenderer, allowUseShell, allowFileMutation, ct, injectionQueue)
-                            .ConfigureAwait(false);
+                            // The Sub Agents keep the shared cache warm themselves (pinned breakpoint), so no pings meanwhile.
+                            Dictionary<string, (bool success, string message)> batchReports;
+                            using (keepAlive.Suspend())
+                            {
+                                batchReports = await RunDispatchBatchAsync(
+                                    batch, messages, tools, client, settings, effectiveSystemPrompt,
+                                    logger, renderer, ct, injectionQueue, toolResults, roundResume)
+                                    .ConfigureAwait(false);
+                            }
 
-                        logger.EndSubAgentDispatch(subSuccess, subMessage);
+                            foreach (var kv in batchReports) dispatchReports[kv.Key] = kv.Value;
+                            report = dispatchReports[id];
 
-                        logger.LogInfo("🤖 Sub Agent reported back.");
+                            logger.LogInfo(batch.Count == 1
+                                ? "🤖 Sub Agent reported back."
+                                : $"🤖 All {batch.Count} Sub Agents reported back.");
+                        }
 
-                        string reportPreview = $"[Sub Agent {(subSuccess ? "SUCCESS" : "FAILURE")}] {subMessage}";
+                        string reportPreview = $"[Sub Agent {(report.success ? "SUCCESS" : "FAILURE")}] {report.message}";
                         logger.LogToolResult(id, reportPreview);
 
                         toolResults.Add(new JsonObject
@@ -178,22 +340,23 @@ namespace GTA.Builder
                     }
 
                     ToolRegistry.ProgressSink = msg => logger.LogToolProgress(name, msg);
-                    (bool found, object result) execResult;
+                    (bool found, object result, bool stopped) execResult;
                     try
                     {
-                        execResult = ToolRegistry.TryExecute(name, input);
+                        // Runs the tool on its own thread and waits for it OR for STOP, whichever comes first.
+                        execResult = await ExecuteToolCancellableAsync(name, input, ct).ConfigureAwait(false);
                     }
                     finally
                     {
                         ToolRegistry.ProgressSink = null;
                     }
-                    var (found, result) = execResult;
+                    var (found, result, stopped) = execResult;
 
                     if (!found)
                     {
                         logger.LogError($"Unknown tool: {name}");
                         toolResults.Add(MessageBuilder.MakeTextToolResult(
-                            id, $"Error: Unknown tool '{name}'"));
+                            id, UnknownToolMessage(name)));
                         continue;
                     }
 
@@ -206,8 +369,23 @@ namespace GTA.Builder
                         ["tool_use_id"] = id,
                         ["content"]     = ToolRegistry.ToContentNode(result),
                     });
-                }
 
+                    // STOP arrived while this tool ran. Its (partial / "stopped") result is saved above.
+                    // Now leave the loop: the catch below answers every tool call that did not run.
+                    if (stopped) ct.ThrowIfCancellationRequested();
+                }
+                }
+                catch (OperationCanceledException)
+                {
+                    // STOP in the middle of a tool phase. The assistant message with ALL its tool_use blocks is already
+                    // in the history, so EVERY tool_use needs a tool_result now, or the next call of this chat fails.
+                    // Real results of tools that already finished are kept. The others get a "stopped" result.
+                    keepAlive.Stop();
+                    CompleteInterruptedToolResults(blocks, toolResults, logger);
+                    messages.Add(new JsonObject { ["role"] = "user", ["content"] = toolResults });
+                    throw;
+                }
+                sessionUsage += keepAlive.Stop();   // cost of the cache keep-alive pings (0 when no tool ran long)
                 messages.Add(new JsonObject { ["role"] = "user", ["content"] = toolResults });
             }
 
@@ -222,6 +400,185 @@ namespace GTA.Builder
             }
         }
 
+        // ── Parallel Sub Agents ─────────────────────────────────────────────────────────
+
+        private static bool IsDispatchBlock(JsonNode? block) =>
+            block?["type"]?.GetValue<string>() == "tool_use" &&
+            string.Equals(block["name"]?.GetValue<string>(), "dispatch_sub_agent", StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Runs EVERY dispatch_sub_agent call of ONE model response at the same time and waits until all of them
+        /// are done (success, failure or error). Returns one report per tool_use id.
+        ///
+        /// Rules:
+        ///   - At most <see cref="AppConfig.MAX_PARALLEL_SUB_AGENTS"/> run at once. The others wait for a free slot.
+        ///   - The parent history is NOT changed while the batch runs. Every Sub Agent gets its own copy.
+        ///   - One Sub Agent that fails never kills the others. It only gives a "failure" report.
+        ///   - STOP cancels all of them. Every twin session is closed before the stop goes up.
+        ///   - PAUSE: every Sub Agent holds before its next round (see <see cref="LiveSubAgent"/>). The batch is registered
+        ///     in the parent's <see cref="DispatchTracker"/>, so the host can save it and a later run can continue it:
+        ///     <paramref name="resume"/> carries the state of every Sub Agent (queued / running with its history / done).
+        /// </summary>
+        private static async Task<Dictionary<string, (bool success, string message)>> RunDispatchBatchAsync(
+            List<(string id, JsonObject input)> dispatches,
+            JsonArray              messages,
+            JsonArray              tools,
+            ILlmClient             client,
+            RunSettings            settings,
+            string                 systemPrompt,
+            IAgentLogger           logger,
+            IStreamRenderer        renderer,
+            CancellationToken      ct,
+            IPromptInjectionQueue? parentGate,
+            JsonArray              toolResults,
+            DispatchResumeState?   resume)
+        {
+            // One snapshot, taken on this thread. Each Sub Agent clones from it, so no two threads
+            // ever read the live parent history at the same time.
+            var messagesSnapshot = (JsonArray)messages.DeepClone();
+            var toolsSnapshot    = (JsonArray)tools.DeepClone();
+
+            int maxParallel = Math.Max(1, AppConfig.MAX_PARALLEL_SUB_AGENTS);
+            using var slots = new SemaphoreSlim(maxParallel);
+
+            var resumedById = new Dictionary<string, LiveSubAgent>(StringComparer.Ordinal);
+            if (resume != null)
+                foreach (LiveSubAgent a in resume.Agents) resumedById[a.DispatchId] = a;
+
+            var agents = new List<LiveSubAgent>();
+            foreach ((string id, JsonObject input) in dispatches)
+            {
+                if (resumedById.TryGetValue(id, out LiveSubAgent? previous))
+                {
+                    agents.Add(previous);   // continues where it was paused (or is already done)
+                    continue;
+                }
+
+                agents.Add(new LiveSubAgent
+                {
+                    DispatchId        = id,
+                    Task              = input["task"]?.GetValue<string>() ?? string.Empty,
+                    AllowUseShell     = GetOptionalBoolInput(input, "allow_use_shell", false),
+                    AllowFileMutation = GetOptionalBoolInput(input, "allow_file_mutation", false),
+                });
+            }
+
+            DispatchTracker? tracker = parentGate?.DispatchTracker;
+            tracker?.Begin(toolResults, agents, maxParallel);
+            try
+            {
+                var running = new List<(string id, Task<(bool success, string message)> task)>();
+                foreach (LiveSubAgent live in agents)
+                {
+                    Task<(bool success, string message)> t;
+                    if (live.State == LiveSubAgent.StateDone)
+                    {
+                        // Finished before the pause: its report is all that is needed.
+                        t = Task.FromResult((live.Success, live.Message ?? string.Empty));
+                    }
+                    else
+                    {
+                        LiveSubAgent captured = live;
+                        t = Task.Run(() => RunOneParallelSubAgentAsync(
+                            captured, messagesSnapshot, toolsSnapshot, client, settings, systemPrompt,
+                            logger, renderer, slots, ct, parentGate));
+                    }
+                    running.Add((live.DispatchId, t));
+                }
+
+                // Every task handles its own errors (see RunOneParallelSubAgentAsync). Only STOP can make WhenAll throw,
+                // and it throws AFTER all tasks ended, so every twin session is already closed at that point.
+                await Task.WhenAll(running.ConvertAll(r => r.task)).ConfigureAwait(false);
+
+                var reports = new Dictionary<string, (bool success, string message)>(StringComparer.Ordinal);
+                foreach ((string id, Task<(bool success, string message)> task) in running)
+                    reports[id] = task.Result;
+                return reports;
+            }
+            finally
+            {
+                tracker?.End();
+            }
+        }
+
+        private static async Task<(bool success, string message)> RunOneParallelSubAgentAsync(
+            LiveSubAgent           live,
+            JsonArray              messagesSnapshot,
+            JsonArray              toolsSnapshot,
+            ILlmClient             client,
+            RunSettings            settings,
+            string                 systemPrompt,
+            IAgentLogger           logger,
+            IStreamRenderer        renderer,
+            SemaphoreSlim          slots,
+            CancellationToken      ct,
+            IPromptInjectionQueue? parentGate)
+        {
+            await slots.WaitAsync(ct).ConfigureAwait(false);   // STOP while queued -> OperationCanceledException, no slot taken
+            try
+            {
+                // Has a slot now. (A queued Sub Agent that is still waiting is never counted as "running".)
+                bool resuming = live.Messages != null;   // it was paused in the middle of its work: continue it
+                live.State = LiveSubAgent.StateRunning;
+
+                IAgentLogger? subLogger = null;
+                try
+                {
+                    IStreamRenderer subRenderer;
+                    (subLogger, subRenderer) = resuming && !string.IsNullOrEmpty(live.TwinSessionId)
+                        ? logger.ResumeSubAgentDispatch(live.TwinSessionId!, live.Task, client.ModelName, renderer)
+                        : logger.BeginSubAgentDispatch(live.Task, client.ModelName, renderer);
+                    live.TwinSessionId = subLogger.SessionId ?? live.TwinSessionId;
+
+                    bool   success;
+                    string message;
+                    try
+                    {
+                        (success, message) = await RunDispatchedSubAgentAsync(
+                            messagesSnapshot, toolsSnapshot, live.Task, client, settings, systemPrompt,
+                            subLogger, subRenderer, live.AllowUseShell, live.AllowFileMutation, ct, parentGate, live)
+                            .ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // STOP while this Sub Agent works: close its twin chat (it must not stay "running" forever).
+                        try { logger.EndSubAgentDispatch(subLogger, false, "⏹ Stopped by the user."); } catch { /* never block the stop */ }
+                        throw;
+                    }
+
+                    logger.EndSubAgentDispatch(subLogger, success, message);
+                    live.Success = success;
+                    live.Message = message;
+                    live.State   = LiveSubAgent.StateDone;
+                    return (success, message);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    // Any other problem (UI, logger, ...) only fails THIS Sub Agent. The others keep running.
+                    SessionFileLogger.LogException("Parallel Sub Agent failed outside its own loop", ex);
+                    string msg = $"Sub Agent failed with an unexpected error: {ex.Message}";
+                    if (subLogger != null)
+                    {
+                        try { logger.EndSubAgentDispatch(subLogger, false, msg); } catch { /* ignore */ }
+                    }
+                    live.Success = false;
+                    live.Message = msg;
+                    live.State   = LiveSubAgent.StateDone;
+                    return (false, msg);
+                }
+            }
+            finally
+            {
+                live.AtFence = false;
+                slots.Release();
+            }
+        }
+
+
         private static async Task<(bool success, string message)> RunDispatchedSubAgentAsync(
             JsonArray         realMessages,
             JsonArray         realTools,
@@ -234,35 +591,70 @@ namespace GTA.Builder
             bool              allowUseShell,
             bool              allowFileMutation,
             CancellationToken ct,
-            IPromptInjectionQueue? parentGate = null)
+            IPromptInjectionQueue? parentGate = null,
+            LiveSubAgent?     live = null)
         {
-            var subMessages = new JsonArray();
-            for (int i = 0; i < realMessages.Count - 1; i++)
-                subMessages.Add(realMessages[i]?.DeepClone());
+            live ??= new LiveSubAgent { Task = task, AllowUseShell = allowUseShell, AllowFileMutation = allowFileMutation };
 
-            subMessages.Add(new JsonObject
+            // RESUME: the Sub Agent was paused earlier (maybe before an app restart). Its history, tools and round
+            // were saved in 'live'. Everything is continued from there; nothing is rebuilt.
+            bool resuming = live.Messages != null;
+
+            JsonArray subMessages;
+            JsonArray subTools;
+
+            if (resuming)
             {
-                ["role"] = "user",
-                ["content"] =
-                    "───── 🤖 SUB AGENT DISPATCH ─────\n" +
-                    "You have been dispatched, as a Sub Agent, to accomplish EXACTLY one task, " +
-                    "described below. You are STRICTLY PROHIBITED from doing anything outside this " +
-                    "task — no tangents, no unrelated exploration, and no asking anything back (there " +
-                    "is nobody available to answer you — make reasonable assumptions and proceed). " +
-                    "When you are done — whether you fully succeeded, partially succeeded, or could " +
-                    "not complete it at all — you MUST end your turn with a normal, PLAIN TEXT reply " +
-                    "(do NOT call any tool as your final action) formatted EXACTLY like this, as the " +
-                    "very last thing you write:\n\n" +
-                    "STATUS: success (or STATUS: failure)\n" +
-                    "MESSAGE: <a complete summary of what you did, found, or concluded>\n\n" +
-                    "That is the ONLY way you can end this task — nothing you say outside of that " +
-                    "final STATUS/MESSAGE reply will ever be seen by anyone.\n\n" +
-                    "YOUR TASK:\n" + task + "\n───── END DISPATCH ─────",
-            });
+                subMessages = live.Messages!;
+                subTools    = live.Tools ?? (JsonArray)realTools.DeepClone();
+            }
+            else
+            {
+                subMessages = new JsonArray();
+                for (int i = 0; i < realMessages.Count - 1; i++)
+                    subMessages.Add(realMessages[i]?.DeepClone());
 
-            var subTools = new JsonArray();
-            foreach (JsonNode? t in realTools)
-                subTools.Add(t?.DeepClone());
+                // CACHE KEEP-WARM: pin a prompt-cache breakpoint on the LAST message that is shared with the
+                // parent (index Count-2 of the parent history; the parent's last message is the dispatch
+                // tool_use, which the Sub Agent does not copy). Every Sub Agent request then re-touches this
+                // cache entry, so the parent's history does not hit the 5-minute TTL while the Sub Agent works.
+                // The parent's next request (after the report) finds this entry by its 20-block look-back.
+                int sharedLast = realMessages.Count - 2;
+                if (sharedLast >= 0 &&
+                    subMessages[sharedLast] is JsonObject pinMsg &&
+                    pinMsg["role"]?.GetValue<string>() == "user")
+                {
+                    pinMsg[AzureApiClient.CachePinKey] = true;
+                }
+                subMessages.Add(new JsonObject
+                {
+                    ["role"] = "user",
+                    ["content"] =
+                        "───── 🤖 SUB AGENT DISPATCH ─────\n" +
+                        "You have been dispatched, as a Sub Agent, to accomplish EXACTLY one task, " +
+                        "described below. You are STRICTLY PROHIBITED from doing anything outside this " +
+                        "task — no tangents, no unrelated exploration, and no asking anything back (there " +
+                        "is nobody available to answer you — make reasonable assumptions and proceed). " +
+                        "When you are done — whether you fully succeeded, partially succeeded, or could " +
+                        "not complete it at all — you MUST end your turn with a normal, PLAIN TEXT reply " +
+                        "(do NOT call any tool as your final action) formatted EXACTLY like this, as the " +
+                        "very last thing you write:\n\n" +
+                        "STATUS: success (or STATUS: failure)\n" +
+                        "MESSAGE: <a complete summary of what you did, found, or concluded>\n\n" +
+                        "That is the ONLY way you can end this task — nothing you say outside of that " +
+                        "final STATUS/MESSAGE reply will ever be seen by anyone.\n\n" +
+                        "YOUR TASK:\n" + task + "\n───── END DISPATCH ─────",
+                });
+
+                subTools = new JsonArray();
+                foreach (JsonNode? t in realTools)
+                    subTools.Add(t?.DeepClone());
+            }
+
+            // Visible to the host's pause tracker (see DispatchTracker): while this Sub Agent holds at its fence,
+            // these two are a complete, untouched picture of it.
+            live.Messages = subMessages;
+            live.Tools    = subTools;
 
             string subSystemPrompt = parentSystemPrompt;
 
@@ -274,19 +666,27 @@ namespace GTA.Builder
             string?    reportMessage    = null;
             TokenUsage subSessionUsage  = default;
             int        subRoundsRun     = 0;
+            int        subGhostRetries  = resuming ? live.GhostRetries : 0;
 
             try
             {
-                for (int round = 1; round <= AppConfig.MAX_AGENTIC_ROUNDS; round++)
+                for (int round = resuming ? Math.Max(1, live.NextRound) : 1; round <= AppConfig.MAX_AGENTIC_ROUNDS; round++)
                 {
                     ct.ThrowIfCancellationRequested();
 
-                    // BUG FIX: the sub agent never looked at any pause, so "Pause" did nothing while it ran.
-                    await WaitWhilePausedAsync(subLogger, ct, parentGate, subLogger.PauseGate)
+                    live.NextRound    = round;
+                    live.GhostRetries = subGhostRetries;
+
+                    // A pause of the PARENT holds this Sub Agent too (it can not be paused on its own). The holds of the
+                    // parent / of this Sub Agent's own session (💉 Inject window) are respected as before.
+                    await WaitWhilePausedAsync(subLogger, ct, parentGate, h => live.AtFence = h,
+                            parentGate, subLogger.PauseGate)
                         .ConfigureAwait(false);
 
                     subLogger.LogRound(round);
-
+                    // Shrink every image that is too big for the API (it refuses the WHOLE request for one bad image).
+                    GTA.Tools.Impl.Common.ImageHistoryGuard.ShrinkOversizedImages(subMessages, subLogger);
+                    long subCallStartTs = Stopwatch.GetTimestamp();   // the cache is refreshed by this call
                     JsonObject? resp = await client.CallAsync(
                         subMessages,
                         subTools,
@@ -299,6 +699,8 @@ namespace GTA.Builder
                         subRenderer,
                         ct).ConfigureAwait(false);
 
+                    // STOP during the model call: never treat it as "call failed" (null) and never use a half answer.
+                    ct.ThrowIfCancellationRequested();
                     if (resp == null)
                     {
                         reportMessage = "Sub Agent's LLM call failed outright (see the main log for " +
@@ -311,10 +713,28 @@ namespace GTA.Builder
                     subRoundsRun++;
                     subLogger.LogTokenUsage(subRoundUsage);
 
-                    JsonArray blocks = resp["content"]?.AsArray() ?? new JsonArray();
-                    subMessages.Add(new JsonObject { ["role"] = "assistant", ["content"] = blocks.DeepClone() });
+                    JsonArray blocks     = resp["content"]?.AsArray() ?? new JsonArray();
+                    string    stopReason = resp["stop_reason"]?.GetValue<string>() ?? "unknown";
 
-                    string stopReason = resp["stop_reason"]?.GetValue<string>() ?? "unknown";
+                    // Same ghost-tool-call handling as the main loop (see there).
+                    if (stopReason == "tool_use")
+                    {
+                        if (subGhostRetries < MaxGhostRetries)
+                        {
+                            List<string> dropped = StripGhostToolCalls(blocks, subLogger);
+                            if (dropped.Count > 0 && !ContainsToolUse(blocks))
+                            {
+                                subGhostRetries++;
+                                subLogger.LogWarning(
+                                    $"Sub Agent called non-existent tool(s): {string.Join(", ", dropped)}. " +
+                                    $"Dropped from history, asking again ({subGhostRetries}/{MaxGhostRetries}).");
+                                continue;
+                            }
+                        }
+                        subGhostRetries = 0;
+                    }
+
+                    subMessages.Add(new JsonObject { ["role"] = "assistant", ["content"] = blocks.DeepClone() });
 
                     if (stopReason != "tool_use")
                     {
@@ -326,6 +746,11 @@ namespace GTA.Builder
 
                     using IDisposable subLedgerScope = FileViewLedger.BeginScope();
                     var subToolResults = new JsonArray();
+
+                    // A long tool must not let the 5-minute prompt cache of this Sub Agent expire.
+                    using CacheKeepAlive subKeepAlive = CacheKeepAlive.Start(
+                        client, subMessages, subTools, subSystemPrompt,
+                        settings.Thinking, settings.Effort, subLogger, subCallStartTs);
 
                     foreach (JsonNode? block in blocks)
                     {
@@ -349,16 +774,18 @@ namespace GTA.Builder
                         }
 
                         ToolRegistry.ProgressSink = msg => subLogger.LogToolProgress(tname, msg);
-                        (bool found, object result) execResult;
-                        try { execResult = ToolRegistry.TryExecute(tname, tin); }
+                        (bool found, object result, bool stopped) execResult;
+                        try { execResult = await ExecuteToolCancellableAsync(tname, tin, ct).ConfigureAwait(false); }
                         finally { ToolRegistry.ProgressSink = null; }
-                        var (found, result) = execResult;
+                        var (found, result, stopped) = execResult;
+                        // STOP while this tool ran: the Sub Agent's own history is thrown away with the whole turn.
+                        if (stopped) ct.ThrowIfCancellationRequested();
 
                         if (!found)
                         {
                             subLogger.LogError($"Unknown tool: {tname}");
                             subToolResults.Add(MessageBuilder.MakeTextToolResult(
-                                tid, $"Error: Unknown tool '{tname}'"));
+                                tid, UnknownToolMessage(tname)));
                             continue;
                         }
 
@@ -372,7 +799,7 @@ namespace GTA.Builder
                             ["content"]     = ToolRegistry.ToContentNode(result),
                         });
                     }
-
+                    subSessionUsage += subKeepAlive.Stop();   // cost of the cache keep-alive pings (0 when no tool ran long)
                     subMessages.Add(new JsonObject { ["role"] = "user", ["content"] = subToolResults });
                 }
 
@@ -404,6 +831,146 @@ namespace GTA.Builder
 
             return (reportSuccess, reportMessage!);
         }
+
+        // ── STOP handling for tools ─────────────────────────────────────────────────────
+
+        /// <summary>How long a tool gets to finish by itself after STOP (tools that watch the token kill their process in this time).</summary>
+        private static readonly TimeSpan ToolStopGrace = TimeSpan.FromSeconds(4);
+
+        /// <summary>Set when the loop stops waiting for a tool. A tool thread that is still running then stays silent in the UI.</summary>
+        private sealed class AbandonFlag { public volatile bool Set; }
+
+        /// <summary>
+        /// Runs ONE tool on its own thread and waits for it OR for STOP, whichever comes first.
+        /// Tools are synchronous methods, so before this the STOP button did nothing while a tool ran
+        /// (run_shell, python, git, http ... blocked the loop until they ended or timed out).
+        ///
+        /// On STOP:
+        ///   - the token is put in <see cref="ToolCancellation.Token"/> (a tool that starts a child process kills the whole
+        ///     process tree and returns a partial result: run_shell, gcc, cmake, inline_python, dotnet, git);
+        ///   - the tool gets <see cref="ToolStopGrace"/> to return; if it does, its result is used (stopped = true);
+        ///   - if not, the loop does NOT wait any more. The tool thread is abandoned (its progress lines are muted) and a
+        ///     "stopped" result is returned. This is the honest limit: a tool that ignores the token (for example a long
+        ///     HTTP request) keeps running in the background until it ends by itself. It can no longer block STOP.
+        /// </summary>
+        private static async Task<(bool found, object result, bool stopped)> ExecuteToolCancellableAsync(
+            string name, JsonObject input, CancellationToken ct)
+        {
+            if (ct.IsCancellationRequested)
+                return (true, ConversationHistoryRepair.StoppedToolResultText, true);
+
+            Action<string>? realSink = ToolRegistry.ProgressSink;
+            var abandoned = new AbandonFlag();
+            Action<string>? sink = realSink == null ? null : m => { if (!abandoned.Set) realSink(m); };
+
+            Task<(bool found, object result)> work = Task.Run(() =>
+            {
+                ToolCancellation.Token    = ct;     // AsyncLocal: only this tool's own call-flow sees it
+                ToolRegistry.ProgressSink = sink;
+                return ToolRegistry.TryExecute(name, input);
+            });
+
+            try
+            {
+                var done = await work.WaitAsync(ct).ConfigureAwait(false);
+                return (done.found, done.result, false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                try
+                {
+                    var done = await work.WaitAsync(ToolStopGrace).ConfigureAwait(false);
+                    return (done.found, done.result, true);
+                }
+                catch (Exception)
+                {
+                    // TimeoutException (tool did not return in time) or a tool failure: fall through to "abandoned".
+                }
+
+                abandoned.Set = true;
+                _ = work.ContinueWith(t => { _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);   // never an unobserved exception
+                SessionFileLogger.Log("TOOL_CALL",
+                    $"STOP: tool '{name}' did not end within {ToolStopGrace.TotalSeconds:0}s. It was abandoned and may still run in the background.");
+                return (true, ConversationHistoryRepair.StoppedToolResultText, true);
+            }
+        }
+
+        /// <summary>
+        /// STOP in the middle of a tool phase: adds a "stopped" tool_result for every tool_use of this response that
+        /// has no result yet (in the original order), and closes its UI widget. Keeps the real results already collected.
+        /// </summary>
+        private static void CompleteInterruptedToolResults(JsonArray blocks, JsonArray toolResults, IAgentLogger logger)
+        {
+            var answered = new HashSet<string>(StringComparer.Ordinal);
+            foreach (JsonNode? r in toolResults)
+            {
+                if (r?["tool_use_id"]?.GetValue<string>() is string rid) answered.Add(rid);
+            }
+
+            // Rebuild in the order of the tool_use blocks (the API does not require the order, but it keeps the log readable).
+            var ordered = new List<JsonNode?>();
+            foreach (JsonNode? block in blocks)
+            {
+                if (block?["type"]?.GetValue<string>() != "tool_use") continue;
+                string? id = block["id"]?.GetValue<string>();
+                if (string.IsNullOrEmpty(id) || answered.Contains(id!)) continue;
+
+                try { logger.LogToolResult(id!, ConversationHistoryRepair.StoppedToolResultText); }   // finishes the widget ("Running…")
+                catch { /* UI problem must not break the stop */ }
+
+                ordered.Add(ConversationHistoryRepair.MakeStoppedToolResult(id!));
+            }
+            foreach (JsonNode? stub in ordered) toolResults.Add(stub);
+        }
+
+        // ── Ghost tool calls (tool names that exist nowhere) ─────────────────────────────
+
+        /// <summary>
+        /// How many times in a row a response made ONLY of non-existent tool calls is silently thrown away and
+        /// requested again. After that, the old behaviour is used: a real tool_result error goes back to the model,
+        /// so a model that keeps repeating the same ghost call still gets told about it and cannot loop forever.
+        /// </summary>
+        private const int MaxGhostRetries = 3;
+
+        /// <summary>
+        /// Removes every tool_use block whose name is not registered AT ALL (not only "not loaded": it does not exist
+        /// in <see cref="ToolRegistry"/>, so load_tools could never add it either). Returns the removed names.
+        /// Removing the block keeps the history valid for the API: every tool_use must have a matching tool_result in
+        /// the next user message, and a block that is gone needs no result. The UI widget that was already created
+        /// while the response streamed is closed with <see cref="IAgentLogger.LogToolAbandoned"/>.
+        /// </summary>
+        private static List<string> StripGhostToolCalls(JsonArray blocks, IAgentLogger logger)
+        {
+            var removed = new List<string>();
+            for (int i = blocks.Count - 1; i >= 0; i--)
+            {
+                JsonNode? block = blocks[i];
+                if (block?["type"]?.GetValue<string>() != "tool_use") continue;
+
+                string name = block["name"]?.GetValue<string>() ?? string.Empty;
+                if (ToolRegistry.IsKnownTool(name)) continue;
+
+                string id = block["id"]?.GetValue<string>() ?? string.Empty;
+                logger.LogToolAbandoned(id, $"'{name}' is not a real tool — call ignored and not sent back to the model.");
+                removed.Insert(0, name);
+                blocks.RemoveAt(i);
+            }
+            return removed;
+        }
+
+        private static bool ContainsToolUse(JsonArray blocks)
+        {
+            foreach (JsonNode? block in blocks)
+                if (block?["type"]?.GetValue<string>() == "tool_use") return true;
+            return false;
+        }
+
+        /// <summary>The error sent back when the silent-retry budget is used up.</summary>
+        private static string UnknownToolMessage(string name) =>
+            $"Error: Unknown tool '{name}'. This tool does not exist at all — it is not loaded and it is not " +
+            "in the tool registry either, so load_tools cannot add it. Do not invent tool names. " +
+            "Call get_available_tools to see the real tools, then use only those names.";
+
 
         private static readonly HashSet<string> AlwaysDeniedForSubAgent =
             new(StringComparer.OrdinalIgnoreCase) { "dispatch_sub_agent", "delegate_task", "ask_questions" };
@@ -498,26 +1065,33 @@ namespace GTA.Builder
             return (true, finalText.Trim());
         }
 
-        private static bool AnyPaused(IPromptInjectionQueue?[] gates)
+        private static bool ShouldHold(IPromptInjectionQueue? userPauseGate, IPromptInjectionQueue?[] gates)
         {
+            if (userPauseGate != null && userPauseGate.IsPauseRequested) return true;   // the user's ⏸ Pause
             foreach (IPromptInjectionQueue? g in gates)
-                if (g != null && g.IsPaused) return true;
+                if (g != null && g.IsPaused) return true;                               // a hold, e.g. the 💉 Inject window
             return false;
         }
 
         /// <summary>
-        /// Holds while ANY of the gates says "paused". The main loop passes its own session's gate.
-        /// A dispatched sub agent passes BOTH its parent's gate and its own session's gate, so pausing
-        /// either one really stops the sub agent before its next round.
+        /// Holds while the user asked for a pause (<paramref name="userPauseGate"/>.IsPauseRequested) OR any of the
+        /// <paramref name="gates"/> holds (💉 Inject window). The main loop passes its own session's runtime as
+        /// <paramref name="userPauseGate"/>; a dispatched Sub Agent passes its PARENT's runtime, so pausing the parent
+        /// stops every Sub Agent before its next round, and the Sub Agent can not be paused on its own.
+        /// <paramref name="fenceHold"/> is told true when the hold starts and false when it ends: the host knows that
+        /// the history of this loop is complete and not changing while it is true.
         /// </summary>
         private static async Task WaitWhilePausedAsync(
             IAgentLogger                 logger,
             CancellationToken            ct,
+            IPromptInjectionQueue?       userPauseGate,
+            Action<bool>?                fenceHold,
             params IPromptInjectionQueue?[] gates)
         {
-            if (!AnyPaused(gates)) return;
+            if (!ShouldHold(userPauseGate, gates)) return;
 
             foreach (IPromptInjectionQueue? g in gates) g?.OnPauseWaitStart();
+            fenceHold?.Invoke(true);
             try
             {
                 logger.LogInfo(
@@ -526,13 +1100,14 @@ namespace GTA.Builder
                     "explicit \"⏸ Pause\"/\"▶ Resume\" button, or the hold of the 💉 Inject window, " +
                     "whichever is currently holding it.");
 
-                while (AnyPaused(gates))
+                while (ShouldHold(userPauseGate, gates))
                     await Task.Delay(200, ct).ConfigureAwait(false);
 
                 logger.LogInfo("▶ Resumed — continuing to the next round.");
             }
             finally
             {
+                fenceHold?.Invoke(false);
                 foreach (IPromptInjectionQueue? g in gates) g?.OnPauseWaitEnd();
             }
         }
@@ -761,10 +1336,12 @@ namespace GTA.Builder
             if (u == null) return default;
             return new TokenUsage
             {
-                InputTokens              = u["input_tokens"]?.GetValue<int>()                ?? 0,
-                OutputTokens             = u["output_tokens"]?.GetValue<int>()               ?? 0,
-                CacheCreationInputTokens = u["cache_creation_input_tokens"]?.GetValue<int>() ?? 0,
-                CacheReadInputTokens     = u["cache_read_input_tokens"]?.GetValue<int>()     ?? 0,
+                InputTokens                = u["input_tokens"]?.GetValue<int>()                   ?? 0,
+                OutputTokens               = u["output_tokens"]?.GetValue<int>()                  ?? 0,
+                CacheCreationInputTokens   = u["cache_creation_input_tokens"]?.GetValue<int>()    ?? 0,
+                CacheCreation1hInputTokens = u["cache_creation_1h_input_tokens"]?.GetValue<int>() ?? 0,
+                CacheReadInputTokens       = u["cache_read_input_tokens"]?.GetValue<int>()        ?? 0,
+                CacheTtl1h                 = u["cache_ttl_1h"]?.GetValue<bool>()                  ?? false,
             };
         }
 

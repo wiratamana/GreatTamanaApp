@@ -19,7 +19,7 @@ public sealed class BoxItem
     public string? Extension { get; set; }
 }
 
-public sealed class BoxAdfsLoginClient : IDisposable
+public sealed partial class BoxAdfsLoginClient : IDisposable
 {
     // Tenant-specific hosts (reverse-engineered from the captured log -- see header).
     private readonly string _boxHost;
@@ -30,6 +30,9 @@ public sealed class BoxAdfsLoginClient : IDisposable
     private readonly Action<string>? _log;
     private readonly IDiagnosticDumper? _dumper;
 
+    /// <summary>Where the Box session cookies are saved between program runs. Null = no session cache (every login is a full login).</summary>
+    private readonly string? _sessionFilePath;
+
     /// <summary>True once LoginAsync() has completed successfully.</summary>
     public bool IsLoggedIn { get; private set; }
 
@@ -38,12 +41,14 @@ public sealed class BoxAdfsLoginClient : IDisposable
         string accountHost,
         Action<string>? logger = null,
         IDiagnosticDumper? dumper = null,
-        bool useSystemProxyWithDefaultCredentials = true)
+        bool useSystemProxyWithDefaultCredentials = true,
+        string? sessionFilePath = null)
     {
         _boxHost = boxHost;
         _accountHost = accountHost;
         _log = logger;
         _dumper = dumper;
+        _sessionFilePath = sessionFilePath;
 
         _handler = new HttpClientHandler
         {
@@ -342,18 +347,247 @@ public sealed class BoxAdfsLoginClient : IDisposable
         throw new InvalidOperationException("Unrecognized $Config shape during AAD resolution (no urlPost, no sFT+sCtx).");
     }
 
-    public async Task LoginAsync(string email, string password)
+    /// <summary>
+    /// Box's login pages are now a React SPA. The server answers with an empty shell and puts everything in
+    /// <c>Object.assign(window.Box, {"config":{...}})</c>. Returns that "config" object, or null if the page has none.
+    /// </summary>
+    private static JsonElement? TryExtractBoxConfig(string html)
     {
+        const string marker = "Object.assign(window.Box,";
+        int idx = html.IndexOf(marker, StringComparison.Ordinal);
+        if (idx < 0) return null;
+        int start = html.IndexOf('{', idx);
+        if (start < 0) return null;
+        int depth = 0, i = start; bool inString = false, escape = false;
+        for (; i < html.Length; i++)
+        {
+            char c = html[i];
+            if (inString)
+            {
+                if (escape) escape = false;
+                else if (c == '\\') escape = true;
+                else if (c == '"') inString = false;
+                continue;
+            }
+            if (c == '"') inString = true;
+            else if (c == '{') depth++;
+            else if (c == '}') { depth--; if (depth == 0) { i++; break; } }
+        }
+        try
+        {
+            using var doc = JsonDocument.Parse(html.Substring(start, i - start));
+            return doc.RootElement.TryGetProperty("config", out var cfg) ? cfg.Clone() : null;
+        }
+        catch (JsonException) { return null; }
+    }
+
+    private static string? ConfigString(JsonElement? cfg, params string[] path)
+    {
+        if (cfg is not JsonElement el) return null;
+        foreach (var p in path)
+        {
+            if (el.ValueKind != JsonValueKind.Object || !el.TryGetProperty(p, out el)) return null;
+        }
+        return el.ValueKind == JsonValueKind.String ? el.GetString() : null;
+    }
+
+    #region Session cache (skip the password login when the saved Box session cookies still work)
+
+    /// <summary>One saved cookie.</summary>
+    internal sealed class BoxCookieRecord
+    {
+        public string Name { get; set; } = "";
+        public string Value { get; set; } = "";
+        public string Domain { get; set; } = "";
+        public string Path { get; set; } = "/";
+        public bool Secure { get; set; }
+        public bool HttpOnly { get; set; }
+        /// <summary>Null = session cookie (no expiry time).</summary>
+        public DateTime? ExpiresUtc { get; set; }
+    }
+
+    internal sealed class BoxSessionCache
+    {
+        public string BoxHost { get; set; } = "";
+        public DateTime SavedAtUtc { get; set; }
+        public List<BoxCookieRecord> Cookies { get; set; } = new();
+    }
+
+    /// <summary>Only Box's own cookies are saved. The Microsoft / ADFS cookies are NOT (they would be a much bigger credential).</summary>
+    private static bool IsBoxCookieDomain(string domain)
+    {
+        string d = domain.TrimStart('.').ToLowerInvariant();
+        return d.EndsWith("box.com", StringComparison.Ordinal) || d.EndsWith("box.net", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Saves the Box session cookies (csrf-token + session) to the cache file. The file is as secret as a password
+    /// for as long as the Box session lives, so it belongs in the gitignored Credentials folder.
+    /// Written to a temp file first, then moved, so a second process never reads half a file.
+    /// </summary>
+    private void SaveSessionCache()
+    {
+        if (string.IsNullOrEmpty(_sessionFilePath)) return;
+        try
+        {
+            var cache = new BoxSessionCache { BoxHost = _boxHost, SavedAtUtc = DateTime.UtcNow };
+            foreach (Cookie c in _handler.CookieContainer.GetAllCookies())
+            {
+                if (c.Expired || !IsBoxCookieDomain(c.Domain)) continue;
+                cache.Cookies.Add(new BoxCookieRecord
+                {
+                    Name = c.Name,
+                    Value = c.Value,
+                    Domain = c.Domain,
+                    Path = c.Path,
+                    Secure = c.Secure,
+                    HttpOnly = c.HttpOnly,
+                    ExpiresUtc = c.Expires == DateTime.MinValue ? null : c.Expires.ToUniversalTime(),
+                });
+            }
+            if (cache.Cookies.Count == 0) return;
+
+            string? dir = System.IO.Path.GetDirectoryName(_sessionFilePath);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            string tmp = _sessionFilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            File.WriteAllText(tmp, JsonSerializer.Serialize(cache));
+            File.Move(tmp, _sessionFilePath, overwrite: true);
+            Log($"Box session cache saved ({cache.Cookies.Count} cookies): {_sessionFilePath}");
+        }
+        catch (Exception ex)
+        {
+            Log($"Could not save the Box session cache ({ex.Message}) -- continuing without it.");
+        }
+    }
+
+    /// <summary>Deletes the cache file (the next login is a full ADFS login).</summary>
+    public void ClearSessionCache()
+    {
+        if (string.IsNullOrEmpty(_sessionFilePath)) return;
+        try { if (File.Exists(_sessionFilePath)) File.Delete(_sessionFilePath); } catch { /* best effort */ }
+    }
+
+    /// <summary>One cheap authenticated call: GET /app-api/enduserapp/folder/0. Only a real folder answer (HTTP 200 + JSON with "items") counts.</summary>
+    private async Task<(bool Ok, int Status)> ProbeCoreAsync()
+    {
+        try
+        {
+            var (status, body) = await SendSessionAsync(HttpMethod.Get, $"https://{_boxHost}/app-api/enduserapp/folder/0");
+            bool ok = status == 200 && body.TrimStart().StartsWith('{') && body.Contains("\"items\"", StringComparison.Ordinal);
+            return (ok, status);
+        }
+        catch (Exception ex)
+        {
+            Log($"Box session probe failed: {ex.Message}");
+            return (false, 0);
+        }
+    }
+
+    /// <summary>
+    /// True when Box still accepts the session this client holds in memory (one cheap call).
+    /// Used to tell "session expired" from a genuine "no permission" 403, so a 403 does not cause a needless password login.
+    /// </summary>
+    public async Task<bool> ProbeSessionAsync()
+    {
+        if (!IsLoggedIn) return false;
+        return (await ProbeCoreAsync()).Ok;
+    }
+
+    /// <summary>
+    /// Loads the saved cookies and proves that Box still accepts them with ONE cheap call
+    /// (GET /app-api/enduserapp/folder/0, the same call box_get_folder uses). True = logged in, no password login needed.
+    /// False = no cache, or Box rejected it; the stale cookies are removed from the cookie jar again.
+    /// </summary>
+    private async Task<bool> TryRestoreSessionAsync()
+    {
+        if (string.IsNullOrEmpty(_sessionFilePath)) return false;
+        var restored = new List<Cookie>();
+        try
+        {
+            if (!File.Exists(_sessionFilePath)) { Log("Box session cache: no file yet."); return false; }
+            var cache = JsonSerializer.Deserialize<BoxSessionCache>(File.ReadAllText(_sessionFilePath));
+            if (cache == null || cache.Cookies.Count == 0) { Log("Box session cache: file is empty, ignoring it."); return false; }
+            if (!string.Equals(cache.BoxHost, _boxHost, StringComparison.OrdinalIgnoreCase))
+            { Log("Box session cache: it was saved for another Box host, ignoring it."); return false; }
+
+            foreach (var r in cache.Cookies)
+            {
+                if (r.ExpiresUtc.HasValue && r.ExpiresUtc.Value <= DateTime.UtcNow) continue;
+                var c = new Cookie(r.Name, r.Value, r.Path, r.Domain) { Secure = r.Secure, HttpOnly = r.HttpOnly };
+                if (r.ExpiresUtc.HasValue) c.Expires = r.ExpiresUtc.Value;
+                _handler.CookieContainer.Add(c);
+                restored.Add(c);
+            }
+            if (string.IsNullOrEmpty(GetCsrfTokenFromCookieJar()))
+            { Log("Box session cache: no csrf-token cookie in it (expired?), ignoring it."); RemoveCookies(restored); return false; }
+
+            IsLoggedIn = true; // the probe needs this; it is set back to false below when Box says no
+            var (ok, status) = await ProbeCoreAsync();
+            if (ok)
+            {
+                Log("Box session cache HIT: the saved session cookies still work. No password login.");
+                SaveSessionCache(); // the probe answer may have refreshed the cookies: keep the newest values
+                return true;
+            }
+
+            Log($"Box session cache MISS: Box answered HTTP {status} to the probe (session expired). Doing a full login.");
+        }
+        catch (Exception ex)
+        {
+            Log($"Box session cache: restore failed ({ex.Message}). Doing a full login.");
+        }
+
+        IsLoggedIn = false;
+        RemoveCookies(restored);
+        ClearSessionCache();
+        return false;
+    }
+
+    private void RemoveCookies(List<Cookie> cookies)
+    {
+        foreach (Cookie c in cookies)
+        {
+            try { c.Expired = true; _handler.CookieContainer.Add(c); } catch { /* best effort */ }
+        }
+    }
+
+    #endregion
+
+    /// <summary>
+    /// Logs in. Cheapest first: (1) saved session cookies from the cache file, proven by one probe call, (2) the full
+    /// ADFS username+password login. <paramref name="forceFresh"/> = skip (1).
+    /// </summary>
+    public async Task LoginAsync(string email, string password, bool forceFresh = false)
+    {
+        if (!forceFresh && await TryRestoreSessionAsync())
+            return;
+
         Log($"=== STEP 1: GET https://{_boxHost}/ -> follow redirects down to https://{_accountHost}/login ===");
         var (loginPageUrl, loginPageHtml) = await FollowRedirectsAsync($"https://{_boxHost}/");
         Dump("01_account_login_page.html", loginPageHtml);
 
-        string? requestToken = ExtractNamedInputValue(loginPageHtml, "request_token");
+        // Since late 2026 Box no longer answers with a 302 to account.box.com/login. It answers with a tiny SPA stub
+        // (ent.box.com/login) whose config says {"redirect":{"url":".../account.box.com/login"}} and the BROWSER JS does the redirect.
+        // HttpClient does not run JS, so we follow that "redirect.url" by hand until we reach a page that carries a requestToken.
+        for (int jsHop = 0; jsHop < 3; jsHop++)
+        {
+            var stubCfg = TryExtractBoxConfig(loginPageHtml);
+            if (ExtractNamedInputValue(loginPageHtml, "request_token") != null || ConfigString(stubCfg, "requestToken") != null) break;
+            string? jsRedirect = ConfigString(stubCfg, "redirect", "url");
+            if (string.IsNullOrEmpty(jsRedirect)) break;
+            Log($"    (login page is a SPA stub; following its JS redirect -> {jsRedirect})");
+            (loginPageUrl, loginPageHtml) = await FollowRedirectsAsync(ResolveUrl(loginPageUrl, jsRedirect));
+            Dump($"01b_account_login_page_after_js_redirect{jsHop}.html", loginPageHtml);
+        }
+
+        // Token + form data: legacy HTML form first, new SPA config (window.Box.config) otherwise.
+        var boxCfg = TryExtractBoxConfig(loginPageHtml);
+        string? requestToken = ExtractNamedInputValue(loginPageHtml, "request_token") ?? ConfigString(boxCfg, "requestToken");
         if (string.IsNullOrEmpty(requestToken))
-            throw new InvalidOperationException("Could not find request_token on the account.box.com/login page. Snippet: " + loginPageHtml[..Math.Min(400, loginPageHtml.Length)]);
-        string? loginFormAction = ExtractFormAction(loginPageHtml);
+            throw new InvalidOperationException("Could not find request_token (HTML input) or requestToken (window.Box.config) on the account.box.com/login page. Page URL: " + loginPageUrl + ". Snippet: " + loginPageHtml[..Math.Min(400, loginPageHtml.Length)]);
+        string? loginFormAction = ExtractFormAction(loginPageHtml) ?? ConfigString(boxCfg, "actionUri");
         string loginPostUrl = string.IsNullOrEmpty(loginFormAction) ? loginPageUrl : ResolveUrl(loginPageUrl, loginFormAction);
-        string? redirectUrlField = ExtractNamedInputValue(loginPageHtml, "redirect_url") ?? "/";
+        string? redirectUrlField = ExtractNamedInputValue(loginPageHtml, "redirect_url") ?? ConfigString(boxCfg, "redirectUrl") ?? "/";
         string? loginPageSource = ExtractNamedInputValue(loginPageHtml, "login_page_source") ?? "sso-prompt-login";
 
         Log("=== STEP 2: POST account.box.com/login (request_token) -> Box's PingFederate SSO broker ===");
@@ -454,6 +688,7 @@ public sealed class BoxAdfsLoginClient : IDisposable
 
         IsLoggedIn = true;
         Log($"✅ Login complete. csrf-token={csrf[..Math.Min(12, csrf.Length)]}...");
+        SaveSessionCache();
     }
 
     public string? GetCsrfTokenFromCookieJar()
@@ -463,6 +698,11 @@ public sealed class BoxAdfsLoginClient : IDisposable
             if (c.Name == "csrf-token") return c.Value;
         return null;
     }
+    /// <summary>
+    /// WARNING: this GraphQL listing works ONLY for the ROOT folder "0". For any other id Box answers
+    /// "rootFolderEntries can only be used with the root folder (id = "0")" (tested). Nothing in the app calls it.
+    /// For a real folder use <see cref="ListAllItemsAsync"/> (REST listing, all pages).
+    /// </summary>
 
     public async Task<List<BoxItem>> GetFolderItemsAsync(string folderId, int limit = 100)
     {

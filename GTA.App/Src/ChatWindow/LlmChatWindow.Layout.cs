@@ -232,6 +232,19 @@ public partial class LlmChatWindow
             "Queue text/files/tools to inject into the AI's running turn, starting next round " +
             "(not sent immediately)");
         _injectButton.Click += (_, _) => OpenInjectionWindow();
+        // ⏸ Pause / ⏳ Pausing… / ▶ Resume for EVERYTHING (all running chats and Tasks). See LlmChatWindow.PauseDump.cs.
+        _globalPauseButton = new Button
+        {
+            Content           = "⏸ Pause",
+            FontSize          = 12,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin            = new Thickness(8, 0, 0, 0),
+            Padding           = new Thickness(10, 6, 10, 6),
+            IsEnabled         = false,
+        };
+        UiTheme.StyleButton(_globalPauseButton, BgAiBubble, ColText,
+            hoverBackground: BgHoverItem, pressedBackground: BgActiveItem, borderBrush: ColDivider);
+        _globalPauseButton.Click += (_, _) => OnGlobalPauseClicked();
 
         // ── Header: row 1 = [LLM selector (not in co-worker build) | Inject], row 2 = Title ─
         var topRow = new Grid();
@@ -241,8 +254,20 @@ public partial class LlmChatWindow
         Grid.SetColumn(backendPanel, 0);
         topRow.Children.Add(backendPanel);
 #endif
-        Grid.SetColumn(_injectButton, 1);
-        topRow.Children.Add(_injectButton);
+        // Top-right button group: [🧠 Memory (developer build only) | 💉 Inject]
+        var rightButtons = new StackPanel
+        {
+            Orientation         = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment   = VerticalAlignment.Center,
+        };
+#if !CO_WORKER_USE
+        rightButtons.Children.Add(BuildMemoryDebugButton());
+#endif
+        rightButtons.Children.Add(_globalPauseButton);   // left of 💉 Inject
+        rightButtons.Children.Add(_injectButton);
+        Grid.SetColumn(rightButtons, 1);
+        topRow.Children.Add(rightButtons);
 
         _headerTitle.Margin       = new Thickness(0, 10, 0, 0);
         _headerTitle.TextTrimming = TextTrimming.CharacterEllipsis;
@@ -316,11 +341,13 @@ public partial class LlmChatWindow
         Grid.SetColumn(_inputBox,       1);
         Grid.SetColumn(_sendButton,     2);
         Grid.SetColumn(_forkSendButton, 3);
+        Grid.SetColumn(_pauseButton!,   3);
         Grid.SetColumn(_retryButton,    4);
         inputRow.Children.Add(attachBtn);
         inputRow.Children.Add(_inputBox);
         inputRow.Children.Add(_sendButton);
         inputRow.Children.Add(_forkSendButton);
+        inputRow.Children.Add(_pauseButton!);   // same cell as ⑂ Fork: only one of the two is visible (see RefreshSessionPauseButton)
         inputRow.Children.Add(_retryButton);
 
         _attachmentStripBorder = new Border

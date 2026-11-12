@@ -23,6 +23,15 @@ azure_anthropic_endpoint = ""
 ; Azure cognitive services endpoint for GPT Responses API (AppConfig.GPT_BASE)
 azure_cognitive_endpoint = ""
 
+; Prompt-cache lifetime for Claude: "5m" (default) or "1h". "1h" makes EVERY cache write cost 2x input price, so keep "5m".
+cache_ttl = "5m"
+
+; Cache keep-alive: while ONE tool runs longer than the interval (cmake, tests, long CLI), a tiny request re-reads the
+; cached history so the 5-minute cache does not expire. Costs only a cache READ per ping. "on" (default) or "off".
+cache_keepalive = "on"
+; Seconds between pings (30..280, default 240).
+cache_keepalive_interval_seconds = "240"
+
 ; Primary account (proxy / SSO login)
 cred_primaryaccount_id = ""
 

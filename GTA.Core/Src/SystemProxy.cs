@@ -1,7 +1,10 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
 namespace GTA.Core
@@ -112,6 +115,113 @@ namespace GTA.Core
             vars["NO_PROXY"] = noProxy;
             vars["no_proxy"] = noProxy;
             return vars;
+        }
+
+        // ══════════════════════════════════════════════════════════════════════════
+        //  THE ONE GLOBAL METHOD that prepares ANY child process for the corporate proxy.
+        //  Every tool that starts a process (run_shell, cmake, inline_python, dotnet ...) must call
+        //  ApplyToStartInfo() instead of copying proxy variables by itself. New tool-specific
+        //  adapters (like Scoop below) go HERE, so all tools get them at once.
+        //  (C# port of run-with-proxy-tunnel-v2.ps1, including its "Scoop adapter".)
+        // ══════════════════════════════════════════════════════════════════════════
+
+        // "scoop", "scoop.cmd", "C:\...\shims\scoop.ps1" ... used as a command (not as part of a folder name).
+        private static readonly Regex ScoopCommandRegex = new(
+            @"(?<![\w.\-])scoop(?:\.cmd|\.ps1|\.exe)?(?=[\s""'&|]|$)",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+        private const string ScoopTempDirPrefix = "gta-proxy-scoop-cfg-";
+
+        private sealed class NoScope : IDisposable
+        {
+            public static readonly NoScope Instance = new();
+            public void Dispose() { }
+        }
+
+        private sealed class TempDirScope : IDisposable
+        {
+            private readonly string _dir;
+            public TempDirScope(string dir) => _dir = dir;
+            public void Dispose()
+            {
+                try { if (Directory.Exists(_dir)) Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }
+            }
+        }
+
+        /// <summary>
+        /// Prepares <paramref name="psi"/> (UseShellExecute must be false) so the child process uses the corporate proxy:
+        /// HTTP(S)_PROXY / NO_PROXY variables pointing to the local relay, plus tool-specific adapters.
+        /// <paramref name="commandHint"/> = the command line text, used to detect tools that need an adapter (e.g. Scoop).
+        /// Does nothing (direct connection) when Windows uses no proxy.
+        /// RETURNS a scope: dispose it AFTER the child process has ended (it removes temporary files).
+        /// </summary>
+        public static IDisposable ApplyToStartInfo(ProcessStartInfo psi, string? commandHint = null)
+        {
+            Dictionary<string, string> vars = BuildChildProcessEnvironment();
+            if (vars.Count == 0) return NoScope.Instance;
+
+            foreach (var kv in vars)
+                psi.EnvironmentVariables[kv.Key] = kv.Value;
+
+            // Adapter: Scoop. It downloads with .NET WebRequest, which IGNORES HTTP(S)_PROXY, and only reads
+            // its proxy from its own config file. So: temporary COPY of the Scoop config + "proxy" entry,
+            // activated for this one process with XDG_CONFIG_HOME. The real config.json is never touched.
+            if (!string.IsNullOrEmpty(commandHint) && ScoopCommandRegex.IsMatch(commandHint))
+            {
+                string? tempRoot = TryApplyScoopAdapter(psi, vars["HTTP_PROXY"]);
+                if (tempRoot != null) return new TempDirScope(tempRoot);
+            }
+
+            return NoScope.Instance;
+        }
+
+        private static string? TryApplyScoopAdapter(ProcessStartInfo psi, string localProxyUrl)
+        {
+            try
+            {
+                int port = new Uri(localProxyUrl).Port;
+
+                // Housekeeping: remove copies left behind by runs that were killed (app closed during a command).
+                try
+                {
+                    foreach (string old in Directory.EnumerateDirectories(Path.GetTempPath(), ScoopTempDirPrefix + "*"))
+                    {
+                        if (Directory.GetLastWriteTimeUtc(old) < DateTime.UtcNow.AddHours(-12))
+                            try { Directory.Delete(old, recursive: true); } catch { /* in use or no access */ }
+                    }
+                }
+                catch { /* best effort */ }
+
+                string tempRoot = Path.Combine(Path.GetTempPath(), ScoopTempDirPrefix + Guid.NewGuid().ToString("N")[..8]);
+                string tempScoopDir = Path.Combine(tempRoot, "scoop");
+                Directory.CreateDirectory(tempScoopDir);
+
+                // Where Scoop reads its real config: $XDG_CONFIG_HOME\scoop\config.json, else ~\.config\scoop\config.json.
+                string? configHome = psi.EnvironmentVariables["XDG_CONFIG_HOME"];
+                if (string.IsNullOrWhiteSpace(configHome))
+                    configHome = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".config");
+                string realConfig = Path.Combine(configHome, "scoop", "config.json");
+
+                JsonObject cfg = new();
+                if (File.Exists(realConfig))
+                {
+                    try { cfg = JsonNode.Parse(File.ReadAllText(realConfig)) as JsonObject ?? new JsonObject(); }
+                    catch { /* unreadable: start from an empty config */ }
+                }
+                cfg["proxy"] = $"127.0.0.1:{port}";
+
+                File.WriteAllText(
+                    Path.Combine(tempScoopDir, "config.json"),
+                    cfg.ToJsonString(new JsonSerializerOptions { WriteIndented = true }),
+                    new UTF8Encoding(false));
+
+                psi.EnvironmentVariables["XDG_CONFIG_HOME"] = tempRoot;
+                return tempRoot;
+            }
+            catch
+            {
+                return null; // adapter failed: Scoop downloads may still get 407, but nothing else breaks
+            }
         }
 
         private static async Task AcceptLoopAsync(TcpListener listener)

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -65,7 +65,8 @@ public partial class LlmChatWindow
             if (session.ScheduledAt.HasValue &&
                 session.ScheduledAt.Value <= now &&
                 !session.Runtime.IsProcessing &&
-                !session.IsPaused) // "⏸ Pause" — see LlmChatWindow.Pause.cs
+                !session.IsPaused &&
+                !_globalPauseRequested) // "⏸ Pause": nothing new starts while everything is paused
             {
                 FireScheduledPrompt(session);
             }

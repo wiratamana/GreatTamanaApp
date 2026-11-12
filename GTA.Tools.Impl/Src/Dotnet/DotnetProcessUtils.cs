@@ -47,10 +47,9 @@ namespace GTA.Tools.Impl.Dotnet
             foreach (string a in args)
                 psi.ArgumentList.Add(a);
 
-            // Proxy: Windows system proxy, logged in with the current Windows account (local relay).
-            // Empty (direct connection) when Windows uses no proxy. Nothing is configured in init.ini.
-            foreach (var kv in ProxyBridge.BuildChildProcessEnvironment())
-                psi.EnvironmentVariables[kv.Key] = kv.Value;
+            // Proxy: ONE global method (Windows system proxy, current Windows login via local relay;
+            // direct connection when Windows uses no proxy). Disposed when this method returns.
+            using IDisposable proxyScope = ProxyBridge.ApplyToStartInfo(psi);
 
             try
             {
@@ -60,19 +59,25 @@ namespace GTA.Tools.Impl.Dotnet
                 var stdoutTask = proc.StandardOutput.ReadToEndAsync();
                 var stderrTask = proc.StandardError.ReadToEndAsync();
 
-                bool exited = proc.WaitForExit(timeoutMs);
+                // Waits in small steps: kills the whole tree on timeout AND when the user presses STOP.
+                bool exited = ToolCancellation.WaitForExitOrKill(proc, timeoutMs, out bool cancelled);
                 if (!exited)
-                {
                     timedOut = true;
-                    try { proc.Kill(entireProcessTree: true); } catch { }
-                    try { proc.WaitForExit(3000); } catch { }
-                }
 
                 // Drain whatever output is available — streams close once the
                 // process (or its killed tree) exits, so these complete either way.
                 try { stdout = stdoutTask.Result; } catch { }
                 try { stderr = stderrTask.Result; } catch { }
 
+                if (cancelled)
+                {
+                    string partial = (stdout + "\n" + stderr).Trim();
+                    if (partial.Length > 4000) partial = "…" + partial[^4000..];
+                    return $"⏹ STOPPED BY USER: 'dotnet {string.Join(' ', args)}' was killed (with all its child " +
+                           "processes) because the user pressed STOP. It did NOT finish. Check the current state " +
+                           "before you repeat it." +
+                           (partial.Length > 0 ? $"\nOutput before the kill:\n{partial}" : "");
+                }
                 exitCode = timedOut ? -1 : proc.ExitCode;
                 return null;
             }

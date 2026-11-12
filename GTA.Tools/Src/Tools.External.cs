@@ -38,6 +38,9 @@ namespace GTA.Tools
                          "powershell -Command \"Get-Content 'file.txt' -Tail 60\" for the last N lines. " +
                          "NETWORK: every command gets the corporate proxy injected by default via " +
                          "HTTP_PROXY/HTTPS_PROXY environment variables. TLS certificate verification stays ON. " +
+                         "'scoop' commands (scoop install ...) are supported too: Scoop ignores those variables, so a " +
+                         "temporary copy of the Scoop config with the proxy is used for that one command (your real " +
+                         "Scoop config is not changed). " +
                          "KNOWN LIMITATION: some external tools (e.g. pip, curl) have no " +
                          "way to be told to trust this proxy's TLS-inspection (MITM) certificate and MAY " +
                          "fail with a TLS/SSL error — this is a known, accepted risk, not a tool " +
@@ -305,20 +308,21 @@ namespace GTA.Tools
             return ("Restricted", "default, no policy set");
         }
 
-        // Proxy for child processes: taken from the Windows system settings, logged in with the current
-        // Windows account (via a local relay). Empty when Windows uses no proxy. Nothing in init.ini.
-        internal static Dictionary<string, string> BuildProxyEnvironmentVariables() =>
-            ProxyBridge.BuildChildProcessEnvironment();
-
+        // Proxy: handled INSIDE ExternalProcessUtils.RunCmdCaptured (via ProxyBridge.ApplyToStartInfo, the one
+        // global method). Nothing to pass here. Do NOT add a private proxy helper in this file again.
         private static string RunShellCore(string cmd, int timeoutSeconds)
         {
-            // Shared runner (also used by gcc / cmake): live output, timeout kill, encoding handling.
+            // Shared runner (also used by gcc / cmake): live output, timeout kill, encoding, proxy.
             CapturedCmdResult r = ExternalProcessUtils.RunCmdCaptured(
                 cmd, "run_shell", null, (long)timeoutSeconds * 1000,
-                BuildProxyEnvironmentVariables(), ToolRegistry.ReportProgress);
+                null, ToolRegistry.ReportProgress);
 
             string timeoutNote = "";
-            if (!r.Exited)
+            if (r.Cancelled)
+            {
+                timeoutNote = ExternalProcessUtils.StoppedByUserNote("run_shell command");
+            }
+            else if (!r.Exited)
             {
                 timeoutNote =
                     $"\n\n⚠ TIMEOUT: command did not finish within {timeoutSeconds}s and was " +
@@ -454,7 +458,10 @@ namespace GTA.Tools
                          "ONLY supports these image formats: PNG, JPG/JPEG, GIF, WEBP. " +
                          "Do NOT call this on any other file type (e.g. .xml, .pdf, .docx, .txt, " +
                          ".json, .svg) — it cannot render them; if called anyway, it returns a " +
-                         "plain error string saying the format is unsupported instead of an image.")]
+                         "plain error string saying the format is unsupported instead of an image. " +
+                         "Big images are scaled down automatically (long side max 1568 px, file max ~3.5 MB), " +
+                         "because the model API rejects bigger images. The file on disk is not changed. " +
+                         "A note tells you the scale factor.")]
         [Parameter(index: 0, name: "path",
             type: "string",
             description: "Full absolute Windows path to the image file (e.g. C:\\screenshots\\ui.png). " +
@@ -470,6 +477,16 @@ namespace GTA.Tools
                     return $"Error: '{path}' is a directory, not an image file.";
                 return $"Error: Image file not found at '{path}'.";
             }
+
+            // Do not even read a monster file into memory (a 100+ MB image can not be shown to the model anyway).
+            try
+            {
+                long fileLength = new FileInfo(path).Length;
+                if (fileLength > 100L * 1024 * 1024)
+                    return $"Error: '{path}' is {fileLength / (1024 * 1024)} MB. That is too big to load. " +
+                           "Make a much smaller copy of the image (scale it down or crop it) and call load_image on the copy.";
+            }
+            catch (Exception) { /* the read below reports the real problem */ }
 
             byte[] bytes;
             try
@@ -506,10 +523,28 @@ namespace GTA.Tools
                 }
             }
 
-            string b64       = Convert.ToBase64String(bytes);
             string mediaType = sniffedMediaType ?? ImageUtils.ResolveMediaType(bytes, path);
 
-            return new JsonArray
+            // GATE: the API refuses images that are too big (HTTP 400 for the WHOLE request, after a slow upload).
+            // Shrink here, so the agent never sends an oversize image.
+            ShrinkResult shrink = ImageShrinker.Shrink(bytes, mediaType);
+            if (shrink.Error != null && shrink.IsOversize)
+            {
+                return $"Error: '{path}' is too big to send to the model ({shrink.OrigWidth}x{shrink.OrigHeight} px, " +
+                       $"{bytes.Length / 1024} KB) and it could not be resized automatically: {shrink.Error}. " +
+                       $"The limit is {ImageShrinker.MaxLongEdge} px on the long side and {ImageShrinker.MaxBytes / 1024} KB. " +
+                       "Make a smaller copy of the image (for example crop it, or scale it down) and call load_image on that copy.";
+            }
+
+            if (shrink.Changed)
+            {
+                bytes     = shrink.Bytes;
+                mediaType = shrink.MediaType;
+            }
+
+            string b64 = Convert.ToBase64String(bytes);
+
+            var result = new JsonArray
             {
                 new JsonObject
                 {
@@ -522,6 +557,23 @@ namespace GTA.Tools
                     }
                 }
             };
+
+            if (shrink.Changed)
+            {
+                result.Add(new JsonObject
+                {
+                    ["type"] = "text",
+                    ["text"] = $"[Note: the image file '{path}' is {shrink.OrigWidth}x{shrink.OrigHeight} px " +
+                               $"({shrink.OrigBytes / 1024} KB). It was scaled down automatically to " +
+                               $"{shrink.NewWidth}x{shrink.NewHeight} px ({bytes.Length / 1024} KB) because the model API " +
+                               $"does not accept big images. The file on disk is NOT changed. If you read pixel positions " +
+                               $"from this image, multiply them by {(double)shrink.OrigWidth / shrink.NewWidth:0.###} " +
+                               "to get the position in the original file. To see a small area in more detail, crop it " +
+                               "into a separate smaller image first.]"
+                });
+            }
+
+            return result;
         }
     }
 }

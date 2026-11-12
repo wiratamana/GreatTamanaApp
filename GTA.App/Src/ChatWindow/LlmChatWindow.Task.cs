@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -74,6 +74,13 @@ public partial class LlmChatWindow
     /// <summary>Continues a Task session that was interrupted</summary>
     internal void ResumeInterruptedTask(ChatSession session)
     {
+        // Paused in the pause file: continue EXACTLY where it paused (also the step that was paused in the middle of its turn).
+        if (session.Runtime.RestoredPause != null)
+        {
+            ResumeOwner(session);
+            return;
+        }
+
         int historicalThrough = ComputeHistoricalCompletedThroughIndex(session.TaskUnits);
         int startIndex        = historicalThrough + 1;
         if (startIndex >= session.TaskUnits.Count) return; // already fully done
@@ -189,7 +196,8 @@ public partial class LlmChatWindow
             if (session.IsTask &&
                 session.TaskScheduledAt.HasValue &&
                 session.TaskScheduledAt.Value <= now &&
-                !session.IsPaused) // "⏸ Pause" — see LlmChatWindow.Pause.cs
+                !session.IsPaused &&
+                !_globalPauseRequested) // "⏸ Pause": nothing new starts while everything is paused
             {
                 FireScheduledTask(session);
             }
@@ -255,8 +263,12 @@ public partial class LlmChatWindow
             _messagesScroll.ScrollToEnd();
     }
 
-    /// <summary>Executes session's ChatSession.TaskUnits strictly in array order</summary>
-    private async Task RunTaskAsync(ChatSession session, int startIndex = 0)
+    /// <summary>
+    /// Executes session's ChatSession.TaskUnits strictly in array order, starting at startIndex.
+    /// resumeEntry (only after a restart from the pause file, see LlmChatWindow.PauseDump.cs): where the Task was paused —
+    /// its Child entry is the step chat that was paused in the middle of its turn, and that turn is continued, not restarted.
+    /// </summary>
+    private async Task RunTaskAsync(ChatSession session, int startIndex = 0, PauseEntry? resumeEntry = null)
     {
         var runtime = session.Runtime;
         runtime.TaskCancelRequested = false;
@@ -272,6 +284,21 @@ public partial class LlmChatWindow
         runtime.TaskRestartPendingIndexShift  = null;
         runtime.TaskRestartingIndices.Clear();
         runtime.TaskForwardMessageQueue.Clear();
+
+        // Pause bookkeeping (see LlmChatWindow.PauseDump.cs)
+        runtime.TaskLoopActive      = true;
+        runtime.TaskPausedAtIndex   = -1;
+        runtime.TaskStepPausedEarly = false;
+        if (resumeEntry != null)
+            foreach (string forwarded in resumeEntry.ForwardQueue)
+                runtime.TaskForwardMessageQueue.Add(forwarded);
+
+        // A global ⏸ Pause is on while this Task starts: it holds in front of its first step.
+        if (_globalPauseRequested && !session.IsPaused)
+        {
+            session.IsPaused = true;
+            runtime.SetUserPaused(true);
+        }
 
         session.TaskHasRun      = true;
         session.TaskBackendName ??= _selectedBackend;
@@ -305,23 +332,31 @@ public partial class LlmChatWindow
             }
             RefreshSidebarBadge(session);
 
+            // Continuing after a pause: the steps in front of the resume point are done.
+            for (int k = 0; k < startIndex && k < session.TaskUnits.Count; k++)
+                MarkTaskStepCompleted(session, k);
+
             for (int i = startIndex; i < session.TaskUnits.Count; i++)
             {
                 if (runtime.TaskCancelRequested) break;
 
-                if (runtime.IsPaused && !runtime.TaskCancelRequested)
+                // ⏸ Pause (or a 💉 hold): hold in front of the next step. This is a "fence" of the Task: the window
+                // saves the Task here (TaskPausedAtIndex says in front of which step it holds).
+                if ((runtime.IsPauseRequested || runtime.IsPaused) && !runtime.TaskCancelRequested)
                 {
                     runtime.OnPauseWaitStart();
+                    runtime.TaskPausedAtIndex = i;
                     try
                     {
                         UpdateTaskStatusLabel(session, "⏸  Paused — holding before the next step starts…");
-                        while (runtime.IsPaused && !runtime.TaskCancelRequested)
+                        while ((runtime.IsPauseRequested || runtime.IsPaused) && !runtime.TaskCancelRequested)
                             await Task.Delay(TimeSpan.FromMilliseconds(200));
                         if (!runtime.TaskCancelRequested)
                             UpdateTaskStatusLabel(session, "▶  Resumed — continuing…");
                     }
                     finally
                     {
+                        runtime.TaskPausedAtIndex = -1;
                         runtime.OnPauseWaitEnd();
                     }
                 }
@@ -340,7 +375,21 @@ public partial class LlmChatWindow
                 {
                     UpdateTaskStatusLabel(session, $"▶  Step {i + 1}/{total} — sending prompt…");
 
-                    var child = CreateChildTaskSession(session, unit, i);
+                    // After a restart, the step that was paused in the middle of its turn keeps its OWN chat (no new one).
+                    ChatSession child;
+                    PauseEntry? childResume = null;
+                    var existingChild = (resumeEntry?.Child != null && i == startIndex)
+                        ? _sessions.FirstOrDefault(s => s.Id == resumeEntry.Child.SessionId)
+                        : null;
+                    if (existingChild != null)
+                    {
+                        child       = existingChild;
+                        childResume = resumeEntry!.Child;
+                    }
+                    else
+                    {
+                        child = CreateChildTaskSession(session, unit, i);
+                    }
                     runtime.TaskCurrentChildSessionId = child.Id;
 
                     if (i == runtime.TaskRestartTargetIndex && runtime.TaskRestartInjectionMessage != null)
@@ -372,9 +421,17 @@ public partial class LlmChatWindow
                         ? unit.PreloadedToolNames
                         : null;
 
-                    await SendTextToSession(
-                        child, unit.PromptText, stepAttachments, null, stepPreloadTools,
-                        autoTitle: false, backendOverride: session.TaskBackendName);
+                    if (childResume != null)
+                    {
+                        // This step's turn was paused in the middle (see LlmChatWindow.PauseDump.cs): continue it.
+                        await ResumeTurnFromEntryAsync(child, childResume);
+                    }
+                    else
+                    {
+                        await SendTextToSession(
+                            child, unit.PromptText, stepAttachments, null, stepPreloadTools,
+                            autoTitle: false, backendOverride: session.TaskBackendName);
+                    }
 
                     runtime.TaskCurrentChildSessionId = null;
 
@@ -388,6 +445,18 @@ public partial class LlmChatWindow
                 {
                     stepFailed = await RunChainTaskUnitAsync(session, unit, i, total);
                 }
+                // A Wait / Chain step that was cut short by ⏸ Pause is NOT finished: run it again after the resume.
+                // (i-- then the for-loop's i++ lands on the same step; the hold at the top of the loop comes first.)
+                if (runtime.TaskStepPausedEarly)
+                {
+                    runtime.TaskStepPausedEarly = false;
+                    if (!runtime.TaskCancelRequested)
+                    {
+                        i--;
+                        continue;
+                    }
+                }
+
 
                 if (runtime.TaskRestartPendingIndexShift.HasValue && i >= runtime.TaskRestartPendingIndexShift.Value)
                 {
@@ -442,6 +511,9 @@ public partial class LlmChatWindow
         }
 
         runtime.TaskCurrentUnitIndex = -1;
+        runtime.TaskLoopActive       = false;
+        runtime.TaskPausedAtIndex    = -1;
+        runtime.TaskStepPausedEarly  = false;
         runtime.TaskCancelRequested  = false;
         runtime.TaskStatusLabel      = null;
         runtime.TaskPauseButtonRefresh = null; // see ChatSessionRuntime's own doc comment
@@ -449,11 +521,8 @@ public partial class LlmChatWindow
         runtime.TaskWasCancelled = wasCancelled;
         if (hadError) runtime.TaskHadError = true;
 
-        if (session.IsPaused)
-        {
-            session.IsPaused = false;
-            session.Runtime.SetUserPaused(false);
-        }
+        // The Task is over (done, cancelled or failed): its pause, and its entry in the pause file, end here.
+        ClearPauseState(session);
 
         if (bannerBorder != null && statusLabel != null && cancelBtn != null &&
             addTaskBtn != null && insertNextBtn != null && pauseBtn != null)
@@ -522,6 +591,15 @@ public partial class LlmChatWindow
             {
                 var remaining = deadline - DateTimeOffset.Now;
                 if (remaining <= TimeSpan.Zero) break;
+                // ⏸ Pause: stop waiting now. The deadline is saved as an absolute time, so the step continues
+                // with the REST of the wait after the resume (pause time counts as waited time, like any wall clock).
+                if (runtime.IsPauseRequested)
+                {
+                    unit.WaitUntil = deadline.LocalDateTime;
+                    runtime.TaskStepPausedEarly = true;
+                    break;
+                }
+
 
                 UpdateTaskStatusLabel(session,
                     $"⏱  Step {unitIndex + 1}/{total} — waiting {FormatCountdown(remaining)}…");
@@ -559,6 +637,13 @@ public partial class LlmChatWindow
             while (true)
             {
                 if (runtime.TaskCancelRequested) return false; // outer loop treats this as "Cancelled", not "Error"
+                // ⏸ Pause: leave this step now. It is run again after the resume (it re-checks the other task).
+                if (runtime.IsPauseRequested)
+                {
+                    runtime.TaskStepPausedEarly = true;
+                    return false;
+                }
+
 
                 var target = _sessions.FirstOrDefault(s => s.Id == unit.ChainTaskSessionId);
                 if (target == null)
@@ -791,7 +876,10 @@ public partial class LlmChatWindow
 
     /// <summary>True while session is an actively-executing Task container</summary>
     internal bool IsTaskSessionStillRunning(ChatSession session) =>
-        session.IsTask && session.Runtime.TaskCurrentUnitIndex >= 0;
+        session.IsTask &&
+        (session.Runtime.TaskCurrentUnitIndex >= 0 ||
+         session.Runtime.TaskLoopActive ||                 // also while it holds in front of its FIRST step (paused)
+         session.Runtime.RestoredPause != null);           // paused in the pause file: it will continue, so it is not "finished"
 
     /// <summary>Every session currently satisfying IsTaskSessionStillRunning right now</summary>
     internal List<ChatSession> GetCurrentlyRunningTaskSessions(string? excludeSessionId = null) =>
@@ -1189,32 +1277,31 @@ public partial class LlmChatWindow
             Margin     = new Thickness(0, 0, 8, 0),
         };
         ToolTip.SetTip(pauseBtn,
-            "Pauses/resumes the ENTIRE running task — holds before the next step starts, and " +
-            "holds the currently-running step's own turn before its next round too. Persisted " +
-            "— survives closing and relaunching the app.");
+            "Pauses / resumes the ENTIRE running task, including its Sub Agents. It stops at the end of the current " +
+            "round (or between two steps), then everything is saved — you can close the app and continue later with ▶ Resume.");
+
+        int lastPauseBtnState = -1;   // the 100 ms tick calls this; do not restyle a button that did not change
 
         void RefreshPauseBtnVisual()
         {
             bool requested = session.IsPaused;
+            bool settled   = requested && IsPauseSettled(session);
 
-            bool active = session.Runtime.IsPauseActive;
-            if (!active)
-            {
-                string? childId = session.Runtime.TaskCurrentChildSessionId;
-                if (childId != null)
-                {
-                    var child = _sessions.FirstOrDefault(s => s.Id == childId);
-                    if (child != null) active = child.Runtime.IsPauseActive;
-                }
-            }
+            int state = !requested ? 0 : (settled ? 2 : 1);
+            if (state == lastPauseBtnState) return;
+            lastPauseBtnState = state;
 
-            pauseBtn.Content = !requested ? "⏸  Pause" : (active ? "▶  Resume" : "⏳  Pausing…");
+            pauseBtn.Content   = state == 0 ? "⏸  Pause" : (state == 2 ? "▶  Resume" : "⏳  Pausing…");
+            pauseBtn.IsEnabled = state != 1;   // "Pausing…" does nothing: wait until it is paused
 
-            if (!requested)
+            if (state == 0)
                 UiTheme.StyleButton(pauseBtn, BgAiBubble, ColText,
                     hoverBackground: BgHoverItem, pressedBackground: BgActiveItem, borderBrush: ColDivider);
+            else if (state == 2)
+                UiTheme.StyleButton(pauseBtn, ColDoneBadgeBg, ColDoneBadgeFg);
             else
-                UiTheme.StyleButton(pauseBtn, ColRetryAmber, Brushes.White);
+                UiTheme.StyleButton(pauseBtn, ColRetryAmber, Brushes.White,
+                    disabledBackground: ColRetryAmber, disabledForeground: Brushes.White);
         }
         RefreshPauseBtnVisual();
 
@@ -1222,10 +1309,10 @@ public partial class LlmChatWindow
 
         pauseBtn.Click += (_, _) =>
         {
-            if (session.IsPaused)
-                ResumeTaskAndCurrentChild(session);
-            else
-                PauseTaskAndCurrentChild(session);
+            if (!session.IsPaused)
+                RequestPause(session);
+            else if (IsPauseSettled(session))
+                ResumeOwner(session);
             RefreshPauseBtnVisual();
         };
 

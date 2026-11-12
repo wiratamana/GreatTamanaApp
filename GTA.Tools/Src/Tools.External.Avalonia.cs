@@ -1,4 +1,4 @@
-﻿#if !CO_WORKER_USE
+#if !CO_WORKER_USE
 using System;
 using System.Diagnostics;
 using System.IO;
@@ -82,7 +82,11 @@ namespace GTA.Tools
 
                 var stdoutTask = proc.StandardOutput.ReadToEndAsync();
                 var stderrTask = proc.StandardError.ReadToEndAsync();
-                proc.WaitForExit();
+                // Same timeout as before (none), but STOP now kills the script and everything it started.
+                GTA.Core.ToolCancellation.WaitForExitOrKill(proc, -1, out bool stoppedByUser);
+                if (stoppedByUser)
+                    return "⏹ STOPPED BY USER: launch_avalonia.ps1 was killed because the user pressed STOP. " +
+                           "Use check_avalonia_status to see whether the app is running before you retry.";
 
                 string stdout   = stdoutTask.Result.Trim();
                 string stderr   = stderrTask.Result.Trim();

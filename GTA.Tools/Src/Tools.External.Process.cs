@@ -34,8 +34,9 @@ namespace GTA.Tools
                          "HARD-BLOCKED (the app is NOT started, an error comes back): anything inside the Windows " +
                          "system folder (C:\\Windows, System32, ...), shells and script hosts (cmd.exe, powershell.exe, " +
                          "pwsh.exe, bash.exe, wscript.exe, mshta.exe, rundll32.exe ...) wherever they are stored, and " +
-                         "script/installer/shortcut files (.bat .cmd .ps1 .vbs .js .msi .lnk ...). To run a command or " +
-                         "build, use run_shell, cmake or gcc instead.")]
+                         "script/installer/shortcut files (.bat .cmd .ps1 .vbs .js .msi .lnk ...), and Python " +
+                         "(python.exe, pythonw.exe, py.exe, .py files) — to run Python use inline_python, or run it " +
+                         "manually with run_shell. To run a command or build, use run_shell, cmake or gcc instead.")]
         [Parameter(index: 0, name: "path",
             type: "string",
             description: "Full absolute Windows path of the executable (or other launchable file) to " +
@@ -58,6 +59,11 @@ namespace GTA.Tools
                 return "Error: 'path' parameter is missing or empty.";
 
             string path = rawPath.Trim().Trim('"');
+
+            // Special case: Python interpreters get their own, more helpful message.
+            string? pythonBlocked = FindPythonLaunch(path);
+            if (pythonBlocked != null)
+                return pythonBlocked;
 
             // Hard wall: never launch system programs, shells, script hosts or script files.
             string? blockedReason = FindForbiddenLaunch(path, input["arguments"]?.GetValue<string>());
@@ -119,6 +125,66 @@ namespace GTA.Tools
         }
 
         // ── launch guard ──────────────────────────────────────────────────────
+        // Python interpreters / launchers: python.exe, pythonw.exe, python3.exe, python3.12.exe, py.exe, pyw.exe.
+        // Blocked by FILE NAME (also scoop shims, venv copies, junction targets). Python scripts (.py/.pyw)
+        // are blocked too, because Windows would open them with the registered Python interpreter.
+        private static readonly System.Text.RegularExpressions.Regex PythonFileNameRegex = new(
+            @"^(pythonw?(\d+(\.\d+)*)?|pyw?)\.exe$",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+        private static readonly HashSet<string> PythonScriptExtensions = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ".py", ".pyw", ".pyz"
+        };
+
+        /// <summary>Returns the "Python not allowed" error text if the target is a Python interpreter or script, otherwise null.</summary>
+        private static string? FindPythonLaunch(string path)
+        {
+            var candidates = new List<string> { path };
+            try
+            {
+                string full = Path.GetFullPath(path);
+                candidates.Add(full);
+                string? canonical = GetCanonicalPath(full);
+                if (canonical != null) candidates.Add(canonical);
+            }
+            catch (Exception)
+            {
+                // Invalid path: the generic guard / File.Exists check will report it.
+            }
+
+            foreach (string candidate in candidates)
+            {
+                string fileName = Path.GetFileName(candidate);
+                string ext      = Path.GetExtension(candidate);
+                if (PythonFileNameRegex.IsMatch(fileName) || PythonScriptExtensions.Contains(ext))
+                    return BuildPythonBlockedMessage(path);
+            }
+
+            return null;
+        }
+
+        private static string BuildPythonBlockedMessage(string path)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("Error: run_app_background does NOT run Python (python.exe / pythonw.exe / py.exe / .py files). The app was NOT started.");
+            sb.AppendLine($"Target: {path}");
+            sb.AppendLine("This tool is only for your own app, game or local server (for example GreatTamanaEngine.exe).");
+            sb.AppendLine("Do NOT retry with another path, a copy or a renamed file — that is also blocked on purpose.");
+            sb.AppendLine("Instead, use ONE of these:");
+            sb.AppendLine("- inline_python: run a Python snippet given as a string (best for short scripts and file edits).");
+            sb.Append("- run_shell: run Python manually, for example: python \"C:\\path\\to\\script.py\" args");
+
+            try
+            {
+                GTA.Core.SessionFileLogger.Log("TOOL_CALL",
+                    $"run_app_background BLOCKED (python): '{path}'");
+            }
+            catch { /* logging must never break the tool */ }
+
+            return sb.ToString();
+        }
+
 
         // Shells, script hosts and "living off the land" programs. Blocked by FILE NAME, so a copy of
         // them outside C:\Windows (e.g. Git's bash.exe, PowerShell 7 pwsh.exe) is blocked too.
@@ -223,7 +289,7 @@ namespace GTA.Tools
             sb.AppendLine("This tool is only for your own app, game or local server (for example GreatTamanaEngine.exe). " +
                           "Do NOT retry with another path, a copy or a renamed file — that is also blocked on purpose.");
             sb.Append("Instead: to run a command or a build, use run_shell (or the cmake / gcc tools). " +
-                      "To run a script, use run_shell with python \"file.py\".");
+                      "To run a Python script, use inline_python or run_shell.");
 
             try
             {

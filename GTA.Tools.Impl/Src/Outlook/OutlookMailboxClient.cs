@@ -1,4 +1,4 @@
-﻿
+
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
@@ -313,22 +313,28 @@ public sealed class OutlookMailboxClient : IDisposable
         if (hasSearch)
         {
             // Outlook REST API v2.0 does not support combining $search with $filter/$orderby -- $search alone.
-            parts.Add("$search=" + Uri.EscapeDataString($"\"{q.SearchText}\""));
+            // A double quote inside the text would end the quoted phrase early, so it is dropped.
+            parts.Add("$search=" + Uri.EscapeDataString($"\"{q.SearchText!.Replace("\"", " ").Trim()}\""));
         }
         else
         {
             var filters = new List<string>();
             if (q.ReceivedAfter.HasValue) filters.Add($"ReceivedDateTime ge {q.ReceivedAfter.Value.UtcDateTime:yyyy-MM-ddTHH:mm:ssZ}");
             if (q.ReceivedBefore.HasValue) filters.Add($"ReceivedDateTime le {q.ReceivedBefore.Value.UtcDateTime:yyyy-MM-ddTHH:mm:ssZ}");
-            bool hasAddressFilter = !string.IsNullOrWhiteSpace(q.FromAddress) || !string.IsNullOrWhiteSpace(q.CcAddress);
-            if (!string.IsNullOrWhiteSpace(q.FromAddress)) filters.Add($"From/EmailAddress/Address eq '{q.FromAddress}'");
-            if (!string.IsNullOrWhiteSpace(q.CcAddress)) filters.Add($"CcRecipients/any(c:c/EmailAddress/Address eq '{q.CcAddress}')");
+            // Outlook REST can reject "$filter on X + $orderby on ReceivedDateTime" ("InefficientFilter") when the filter is not
+            // only the date range, so $orderby is only sent when ONLY the date range is used. A mail folder is returned newest
+            // first by default anyway, and callers that need a guaranteed order sort the result themselves (see OutlookApi).
+            bool hasNonDateFilter = !string.IsNullOrWhiteSpace(q.FromAddress) || !string.IsNullOrWhiteSpace(q.CcAddress)
+                                    || q.UnreadOnly == true || q.HasAttachmentsOnly == true;
+            // OData string literal: a single quote inside the value is written as two single quotes (stops filter injection).
+            if (!string.IsNullOrWhiteSpace(q.FromAddress)) filters.Add($"From/EmailAddress/Address eq '{EscapeODataString(q.FromAddress)}'");
+            if (!string.IsNullOrWhiteSpace(q.CcAddress)) filters.Add($"CcRecipients/any(c:c/EmailAddress/Address eq '{EscapeODataString(q.CcAddress)}')");
             if (q.UnreadOnly == true) filters.Add("IsRead eq false");
             if (q.HasAttachmentsOnly == true) filters.Add("HasAttachments eq true");
             if (filters.Count > 0)
                 parts.Add("$filter=" + Uri.EscapeDataString(string.Join(" and ", filters)));
 
-            if (!hasAddressFilter)
+            if (!hasNonDateFilter)
                 parts.Add("$orderby=" + Uri.EscapeDataString("ReceivedDateTime desc"));
         }
 
@@ -337,6 +343,8 @@ public sealed class OutlookMailboxClient : IDisposable
 
         return string.Join("&", parts);
     }
+
+    private static string EscapeODataString(string value) => value.Trim().Replace("'", "''");
 
     #endregion
 

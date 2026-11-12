@@ -9,6 +9,7 @@ using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Threading;
+using GTA.Core;
 
 namespace GTA.App;
 
@@ -161,6 +162,11 @@ public partial class LlmChatWindow
         RefreshChromeForActiveSession();
 
         _inputBox.Focus();
+
+        // MEMORY: the chat we just left was freed above; also free every other finished chat that is not on screen,
+        // then compact the heap (low priority: after the new chat is painted).
+        SweepIdleSessions(TimeSpan.Zero);
+        Dispatcher.UIThread.Post(() => MemoryGovernor.Request("chat switch"), DispatcherPriority.Background);
     }
 
     // ── Unload (memory fix) ───────────────────────────────────────────────────
@@ -195,6 +201,49 @@ public partial class LlmChatWindow
         session.IsFullyLoaded         = false;
     }
 
+    /// <summary>
+    /// Frees every chat that is loaded but NOT needed right now: not on screen, no turn running, not part of a
+    /// running Task, nobody waiting on it. Chats that finished in the background (Sub Agent sessions, Task steps,
+    /// scheduled prompts) used to stay fully loaded — with all their widgets — until somebody opened and left them.
+    /// <paramref name="idleFor"/>: a chat that was changed more recently than this is left alone for now.
+    /// Everything freed is already saved, and is read back from disk when the chat is opened again.
+    /// </summary>
+    internal void SweepIdleSessions(TimeSpan? idleFor = null)
+    {
+        TimeSpan grace = idleFor ?? TimeSpan.FromSeconds(45);
+        var now = DateTimeOffset.Now;
+
+        // A running Task owns its current step's chat: never touch those.
+        var busyIds = new HashSet<string>();
+        if (_current != null) busyIds.Add(_current.Id);
+        foreach (var s in _sessions)
+        {
+            if (!IsTaskSessionStillRunning(s)) continue;
+            busyIds.Add(s.Id);
+            if (s.Runtime.TaskCurrentChildSessionId is { } childId) busyIds.Add(childId);
+        }
+
+        int freed = 0;
+        foreach (var s in _sessions.ToList())
+        {
+            if (!s.IsFullyLoaded)                      continue; // nothing in memory
+            if (busyIds.Contains(s.Id))                continue;
+            if (s.Runtime.IsProcessing || s.TurnInProgress) continue;
+            if (s.Runtime.TaskCurrentUnitIndex >= 0)   continue;
+            if (s.Runtime.ActiveSubAgentCount > 0)     continue;
+            if (s.Runtime.OpenAskQuestionsWindow != null) continue;
+            if (s.Runtime.PendingInjectionCount > 0)   continue;
+            if (s.ScheduledAt.HasValue || s.TaskScheduledAt.HasValue) continue; // waiting to fire
+            if (now - s.LastModifiedAt < grace)        continue;
+
+            UnloadSessionIfIdle(s);
+            if (!s.IsFullyLoaded) freed++;
+        }
+
+        if (freed > 0)
+            SessionFileLogger.LogVerbose("MEMORY", $"Sweep: freed {freed} idle chat(s) from memory.");
+    }
+
     /// <summary>Build session's persistent message-bubble panel exactly once (lazy-loading the full session data from disk...</summary>
     private void EnsureSessionPanelBuilt(ChatSession session)
     {
@@ -209,8 +258,7 @@ public partial class LlmChatWindow
         if (session.Messages.Count == 0)
             panel.Children.Add(BuildSessionPlaceholder(session)); // see LlmChatWindow.Task.cs
         else
-            foreach (var msg in session.Messages)
-                panel.Children.Add(BuildMessageBubble(session, msg));
+            BuildMessageWindow(session, panel); // MEMORY: only the newest messages are built; older ones on request
 
         session.Runtime.MessagesPanel = panel;
         session.Runtime.PanelBuilt    = true;
@@ -330,8 +378,10 @@ public partial class LlmChatWindow
         {
             if (item != _activeSessionItem) item.Background = null;
         };
-        item.PointerPressed += (_, _) =>
+        item.PointerPressed += (_, e) =>
         {
+            // Left click only — a right click must just open the context menu, not switch chat.
+            if (!e.GetCurrentPoint(item).Properties.IsLeftButtonPressed) return;
             if (item.Tag is ChatSession s) SwitchSession(s, item);
         };
         foldIcon.PointerPressed += (_, e) =>
@@ -365,6 +415,7 @@ public partial class LlmChatWindow
         var item = row.Item;
         item.Tag = session;
         ToolTip.SetTip(item, SidebarTitle(session));
+        item.ContextMenu = BuildSessionRowMenu(session);
 
         if (isChild)
         {
@@ -439,6 +490,34 @@ public partial class LlmChatWindow
         }
 
         return childStack;
+    }
+
+    /// <summary>
+    /// Right-click menu of a real sidebar row (chat, Task, Task step, Sub Agent):
+    /// "Show in explorer" opens the folder where this session is saved on disk.
+    /// </summary>
+    private ContextMenu BuildSessionRowMenu(ChatSession session)
+    {
+        var showItem = new MenuItem { Header = "📂  Show in explorer" };
+        showItem.Click += (_, _) =>
+        {
+            try
+            {
+                string dir = ConversationPersistence.GetSessionDirectory(session.Id);
+                if (!System.IO.Directory.Exists(dir))
+                    dir = ConversationPersistence.GetSessionsRootDirectory(); // not saved yet — show the parent folder instead
+                System.IO.Directory.CreateDirectory(dir);
+                ImageContextMenu.OpenFolder(dir);
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"Could not open the session folder: {ex.Message}");
+            }
+        };
+
+        var menu = new ContextMenu();
+        menu.Items.Add(showItem);
+        return menu;
     }
 
     /// <summary>Registers child as one more nested row under parent's foldable tree entry — called once per "Prompt" step of a Task.</summary>
@@ -625,7 +704,7 @@ public partial class LlmChatWindow
         refs!.Item.Tag    = child;
         refs.Item.Cursor = new Cursor(StandardCursorType.Hand);
         ToolTip.SetTip(refs.Item, "Click to open this step's own chat");
-        refs.Item.ContextMenu = null;
+        refs.Item.ContextMenu = BuildSessionRowMenu(child); // replaces the "edit step" menu of the waiting row
         refs.TitleText.Text = SidebarTitle(child);
         refs.TimeText.Text  = SidebarMeta(child);
         refs.TitleText.Foreground = ColSideChild;
@@ -917,9 +996,13 @@ public partial class LlmChatWindow
     {
         foreach (var session in _sessions)
         {
+            // A session that is PAUSED and saved (see LlmChatWindow.PauseDump.cs) must stay EXACTLY as it was saved.
+            // Cancelling it would make the loop "close the interrupted turn" (it appends a STOP note to the history),
+            // and saving it again would write that over the paused state. Leave it alone: the pause file continues it.
+            if (session.Runtime.PauseDumped || session.Runtime.RestoredPause != null) continue;
+
             try { session.Runtime.Cts?.Cancel(); }
             catch { /* already cancelled/disposed — ignore */ }
-
             // Never loaded this run → nothing changed → don't touch its file.
             if (!session.IsFullyLoaded) continue;
 

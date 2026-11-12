@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Text.Json;
 
@@ -11,6 +11,12 @@ public static partial class ConversationPersistence
 
     private static string SessionDir(string sessionId) =>
         Path.Combine(SessionsDir, sessionId);
+
+    /// <summary>Folder of one session on disk (metadata.json, session.json, evidence, pasted images ...). It may not exist yet for a brand-new session.</summary>
+    public static string GetSessionDirectory(string sessionId) => SessionDir(sessionId);
+
+    /// <summary>The folder that holds all session folders.</summary>
+    public static string GetSessionsRootDirectory() => SessionsDir;
 
     private static string MetadataFile(string sessionId) =>
         Path.Combine(SessionDir(sessionId), "metadata.json");

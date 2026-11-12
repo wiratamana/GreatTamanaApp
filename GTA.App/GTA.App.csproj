@@ -12,7 +12,25 @@
     <SelfContained>true</SelfContained>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <PublishTrimmed>false</PublishTrimmed>
+
+    <!--
+      MEMORY: small, compacting GC (this is an interactive desktop app, not a server).
+      - Workstation, NON-concurrent GC: no background-GC thread and no extra BGC heap. The heap is small
+        (chat data and widgets are loaded on demand from disk), so a blocking gen2 GC is only a few ms.
+      - TieredPGO off: no instrumentation tier, less JIT memory.
+      - ConserveMemory: gen2 GC compacts fragmented memory and gives it back to the OS sooner.
+      - RetainVM off: freed GC memory goes back to Windows instead of being kept "just in case".
+      MemoryGovernor (Src/App/MemoryGovernor.cs) additionally runs a compacting GC after idle / session switch.
+    -->
+    <ServerGarbageCollector>false</ServerGarbageCollector>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <TieredPGO>false</TieredPGO>
   </PropertyGroup>
+
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="System.GC.ConserveMemory" Value="5" />
+    <RuntimeHostConfigurationOption Include="System.GC.RetainVM" Value="false" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Avalonia"                Version="11.3.12" />
@@ -23,6 +41,15 @@
       <IncludeAssets Condition="'$(Configuration)' != 'Debug'">None</IncludeAssets>
       <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
     </PackageReference>
+  </ItemGroup>
+
+  <!--
+    Memory debug window (self memory dump + heap analysis). NOT part of the co-worker build:
+    the packages are not even referenced there, and the code is compiled out with "#if !CO_WORKER_USE".
+  -->
+  <ItemGroup Condition="'$(CoWorkerUse)' != 'true'">
+    <PackageReference Include="Microsoft.Diagnostics.NETCore.Client" Version="0.2.661903" />
+    <PackageReference Include="Microsoft.Diagnostics.Runtime"        Version="3.1.512801" />
   </ItemGroup>
 
   <ItemGroup>

@@ -1,4 +1,4 @@
-﻿using System.Text.Json.Nodes;
+using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -28,5 +28,22 @@ namespace GTA.Core
                    messages, tools, systemPrompt,
                    maxTokens, thinking, effort,
                    debug, logger, renderer, ct);
+
+        /// <inheritdoc/>
+        public bool SupportsCacheKeepAlive => !AzureApiClient.KeepAliveDisabled;
+
+        /// <inheritdoc/>
+        public string? LastKeepAliveError => AzureApiClient.LastKeepAliveError;
+
+        /// <inheritdoc/>
+        public Task<TokenUsage?> KeepCacheWarmAsync(
+            JsonArray         messages,
+            JsonArray         tools,
+            string            systemPrompt,
+            string            thinking,
+            string            effort,
+            IAgentLogger      logger,
+            CancellationToken ct = default)
+            => AzureApiClient.KeepCacheWarmAsync(messages, tools, systemPrompt, thinking, effort, logger, ct);
     }
 }

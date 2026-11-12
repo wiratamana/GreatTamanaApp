@@ -29,6 +29,10 @@ public partial class LlmChatWindow
         {
             _toolPreloadPopup        = null;
             _toolPreloadPopupSession = null;
+
+            // Write the pick to disk now. Without this it is saved only after the next turn,
+            // so closing the app before sending a message lost the pick.
+            ConversationPersistence.SaveSession(session);
         };
 
         await popup.ShowDialog(this);

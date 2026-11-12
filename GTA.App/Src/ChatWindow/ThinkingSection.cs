@@ -206,7 +206,7 @@ internal sealed class ThinkingSection
             Padding         = new Thickness(10, 2, 2, 2),
             Margin          = new Thickness(10, 3, 0, 2),
             ClipToBounds    = true,   // nothing spills out while the fold animation shrinks it
-            Child           = _scroll,
+            Child           = live ? _scroll : null,   // a replayed thought is folded: its text view is attached on the first open
         };
         _expanded = live;
 
@@ -313,6 +313,7 @@ internal sealed class ThinkingSection
             CancelFold();
             _expanded         = true;
             _scroll.MaxHeight = _live ? LiveMaxHeight : OpenMaxHeight;
+            if (_body.Child == null) _body.Child = _scroll;   // replayed / released thought: put the text view back
             _chevron.Text     = "▾";
             if (_live) _stickTicks = 3;
             _foldTimer = FoldAnimator.Open(_body);
@@ -335,6 +336,8 @@ internal sealed class ThinkingSection
         timer = FoldAnimator.Close(_body, () =>
         {
             _scroll.MaxHeight = _live ? LiveMaxHeight : OpenMaxHeight;
+            // MEMORY: a finished, folded thought keeps no ScrollViewer (templated, ~30 controls) in the visual tree.
+            if (!_live && !_expanded) _body.Child = null;
             if (ReferenceEquals(_foldTimer, timer)) _foldTimer = null;
         });
         _foldTimer = timer;

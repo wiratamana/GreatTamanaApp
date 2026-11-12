@@ -63,8 +63,24 @@ namespace GTA.Tools
 
             new Category(
                 "jira",
-                "JIRA issue tracker: read tickets, read attachments (docx/xlsx/pptx/images/video), post comments.",
+                "JIRA issue tracker: search all tickets by keyword (jira_search: returns ticket numbers + titles), read tickets, read attachments (docx/xlsx/pptx/images/video), post comments.",
                 name => HasAnyTag(name, "jira_api")),
+
+            new Category(
+                "teams",
+                "Microsoft Teams (READ ONLY for you): list chat rooms with their ids (teams_fetch_room_id), " +
+                "read messages of a room by date range (teams_read_messages), look up a user's display name " +
+                "(teams_fetch_user_name), and read the Activity feed: @mentions, replies, reactions (teams_fetch_notifications). " +
+                "Also CALENDARS of any colleague: read events (teams_fetch_calendar) and find a meeting time when several " +
+                "people are all free (teams_find_free_time). " +
+                "Sending messages is not available to you; only the user can enable it.",
+                name => HasAnyTag(name, "teams_api")),
+
+            new Category(
+                "outlook",
+                "Outlook mail (READ ONLY): fetch Inbox mails, newest first (outlook_fetch_mail), with filters for " +
+                "date range, sender, Cc, unread, attachments and free-text search. Good for a daily mail check.",
+                name => HasAnyTag(name, "outlook_api")),
 
             new Category(
                 "xlsx",
@@ -158,10 +174,10 @@ namespace GTA.Tools
             description:
                 "Discover tools that exist but are NOT yet loaded into this conversation's active tool set. " +
 #if CO_WORKER_USE
-                "Call with NO arguments first to see the high-level CATEGORY overview (io, box, jira, ibmcloud, " +
+                "Call with NO arguments first to see the high-level CATEGORY overview (io, box, jira, teams, outlook, ibmcloud, " +
                 "external). Then call again WITH a 'category' argument to see the " +
 #else
-                "Call with NO arguments first to see the high-level CATEGORY overview (io, git, box, jira, ibmcloud, " +
+                "Call with NO arguments first to see the high-level CATEGORY overview (io, git, box, jira, teams, outlook, ibmcloud, " +
                 "dotnet, avalonia, external). Then call again WITH a 'category' argument to see the " +
 #endif
                 "individual tool names (and short descriptions) inside that one category — so you know exactly " +

@@ -59,14 +59,11 @@ namespace GTA.Tools
             int timeoutSeconds = ToolsIOHelpers.GetOptionalInt(input["timeout_seconds"]) ?? 300;
             if (timeoutSeconds <= 0) timeoutSeconds = 300;
 
+            // Proxy is applied inside ExternalProcessUtils (ProxyBridge.ApplyToStartInfo, the one global method).
             return ExternalProcessUtils.RunCommand(
                 "cmake", arguments, workingDirectory, timeoutSeconds * 1000,
-                BuildProxyEnvironmentVariables(), ToolRegistry.ReportProgress);
+                null, ToolRegistry.ReportProgress);
         }
-
-        // Proxy from the Windows system settings, logged in with the current Windows account (local relay).
-        private static Dictionary<string, string> BuildProxyEnvironmentVariables() =>
-            ProxyBridge.BuildChildProcessEnvironment();
     }
 }
 #endif

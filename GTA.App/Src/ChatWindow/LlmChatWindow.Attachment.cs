@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Threading.Tasks;
 using Avalonia;
@@ -59,14 +59,16 @@ public partial class LlmChatWindow
             try
             {
                 var bmp = new Bitmap(filePath);
-                row.Children.Add(new Image
+                var thumb = new Image
                 {
                     Source            = bmp,
                     Width             = 28,
                     Height            = 28,
                     Stretch           = Stretch.UniformToFill,
                     VerticalAlignment = VerticalAlignment.Center,
-                });
+                };
+                ImageContextMenu.Attach(thumb, filePath);
+                row.Children.Add(thumb);
             }
             catch
             {

@@ -708,6 +708,14 @@ public sealed class FileToolCard
         }
     }
 
+    /// <summary>Open the card at once, without animation (used when a replayed card was built because the user clicked its header).</summary>
+    internal void ExpandNow()
+    {
+        _userToggled = true;
+        SetFolded(false, animate: false);
+    }
+
+
     /// <summary>Replay of a saved session whose tool call never got a result.</summary>
     public void MarkNoResult()
     {

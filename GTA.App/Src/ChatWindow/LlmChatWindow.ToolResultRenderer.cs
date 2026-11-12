@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text.Json.Nodes;
@@ -149,6 +149,8 @@ public partial class LlmChatWindow
                     Margin              = new Thickness(0, 4, 0, 2),
                 };
 
+                ImageContextMenu.Attach(img, path); // right-click: Copy image / Show in explorer
+
                 var caption = new SelectableTextBlock
                 {
                     Text         = $"📷 {Path.GetFileName(path)}"
@@ -180,7 +182,7 @@ public partial class LlmChatWindow
             using var ms = new MemoryStream(bytes);
             var bmp = new Bitmap(ms);
 
-            return new Image
+            var image = new Image
             {
                 Source              = bmp,
                 MaxWidth            = 620,
@@ -189,6 +191,8 @@ public partial class LlmChatWindow
                 HorizontalAlignment = HorizontalAlignment.Left,
                 Margin              = new Thickness(0, 4, 0, 4),
             };
+            ImageContextMenu.Attach(image, null, bytes); // right-click: Copy image / Show in explorer
+            return image;
         }
         catch
         {
